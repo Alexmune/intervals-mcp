@@ -50,33 +50,63 @@ server.tool(
     limit: z.number().optional().describe("Max number of activities (default: 20)"),
   },
   async ({ oldest, newest, limit = 20 }) => {
-    const today = new Date().toISOString().split("T")[0];
-    const thirtyAgo = new Date(Date.now() - 30 * 86400000).toISOString().split("T")[0];
-    const params = new URLSearchParams({
-      oldest: oldest || thirtyAgo,
-      newest: newest || today,
-    });
-    const data = await callIntervals(`/athlete/${ATHLETE_ID}/activities?${params}`);
-    const activities = Array.isArray(data) ? data.slice(0, limit) : [];
-    if (activities.length === 0) return { content: [{ type: "text", text: "No activities found in this range." }] };
+    try {
+      const today = new Date().toISOString().split("T")[0];
+      const thirtyAgo = new Date(Date.now() - 30 * 86400000).toISOString().split("T")[0];
+      const params = new URLSearchParams({
+        oldest: oldest || thirtyAgo,
+        newest: newest || today,
+      });
+      const data = await callIntervals(`/athlete/${ATHLETE_ID}/activities?${params}`);
 
-    const summary = activities.map((a) => {
-      const lines = [
-        `📅 ${a.start_date_local?.split("T")[0]} — ${a.name} (${a.type})`,
-        `   ⏱ Duration: ${Math.round((a.moving_time || 0) / 60)} min`,
-        a.distance ? `   📏 Distance: ${(a.distance / 1000).toFixed(2)} km` : null,
-        a.average_heartrate ? `   ❤️  Avg HR: ${Math.round(a.average_heartrate)} bpm` : null,
-        a.average_watts ? `   ⚡ Avg Power: ${Math.round(a.average_watts)} W` : null,
-        a.average_speed ? `   🏃 Avg Pace: ${(1000 / a.average_speed / 60).toFixed(2)} min/km` : null,
-        a.total_elevation_gain ? `   ⛰️  Elevation: ${Math.round(a.total_elevation_gain)} m` : null,
-        a.tss ? `   📊 TSS: ${Math.round(a.tss)}` : null,
-        a.calories ? `   🔥 Calories: ${Math.round(a.calories)} kcal` : null,
-        a.perceived_exertion ? `   😓 RPE: ${a.perceived_exertion}/10` : null,
-      ].filter(Boolean);
-      return lines.join("\n");
-    });
+      // Handle both plain array and wrapped object responses
+      let activities = [];
+      if (Array.isArray(data)) {
+        activities = data.slice(0, limit);
+      } else if (data && Array.isArray(data.activities)) {
+        activities = data.activities.slice(0, limit);
+      } else if (data && typeof data === "object") {
+        // Try to find any array in the response
+        const firstArray = Object.values(data).find(Array.isArray);
+        if (firstArray) activities = firstArray.slice(0, limit);
+      }
 
-    return { content: [{ type: "text", text: summary.join("\n\n") }] };
+      if (activities.length === 0) {
+        return { content: [{ type: "text", text: "No activities found in this range." }] };
+      }
+
+      const summary = activities.map((a) => {
+        // Support both snake_case and camelCase field names
+        const startDate = (a.start_date_local || a.startDateLocal || a.date || "")?.split("T")[0];
+        const movingTime = a.moving_time || a.movingTime || a.elapsed_time || a.elapsedTime || 0;
+        const distance = a.distance || 0;
+        const avgHR = a.average_heartrate || a.averageHeartrate || a.avgHr || null;
+        const avgWatts = a.average_watts || a.averageWatts || a.avgPower || null;
+        const avgSpeed = a.average_speed || a.averageSpeed || null;
+        const elevation = a.total_elevation_gain || a.totalElevationGain || a.elevationGain || null;
+        const tss = a.tss || a.training_stress_score || null;
+        const calories = a.calories || a.total_calories || null;
+        const rpe = a.perceived_exertion || a.perceivedExertion || null;
+
+        const lines = [
+          `📅 ${startDate} — ${a.name || "Activity"} (${a.type || a.sport_type || "Unknown"})`,
+          `   ⏱ Duration: ${Math.round(movingTime / 60)} min`,
+          distance > 0 ? `   📏 Distance: ${(distance / 1000).toFixed(2)} km` : null,
+          avgHR ? `   ❤️  Avg HR: ${Math.round(avgHR)} bpm` : null,
+          avgWatts ? `   ⚡ Avg Power: ${Math.round(avgWatts)} W` : null,
+          avgSpeed ? `   🏃 Avg Pace: ${(1000 / avgSpeed / 60).toFixed(2)} min/km` : null,
+          elevation ? `   ⛰️  Elevation: ${Math.round(elevation)} m` : null,
+          tss ? `   📊 TSS: ${Math.round(tss)}` : null,
+          calories ? `   🔥 Calories: ${Math.round(calories)} kcal` : null,
+          rpe ? `   😓 RPE: ${rpe}/10` : null,
+        ].filter(Boolean);
+        return lines.join("\n");
+      });
+
+      return { content: [{ type: "text", text: summary.join("\n\n") }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `❌ Error fetching activities: ${err.message}` }] };
+    }
   }
 );
 
@@ -129,31 +159,57 @@ server.tool(
     end_date: z.string().optional().describe("End date YYYY-MM-DD (default: today)"),
   },
   async ({ start_date, end_date }) => {
-    const today = new Date().toISOString().split("T")[0];
-    const sixWeeksAgo = new Date(Date.now() - 42 * 86400000).toISOString().split("T")[0];
-    const params = new URLSearchParams({
-      oldest: start_date || sixWeeksAgo,
-      newest: end_date || today,
-    });
-    const data = await callIntervals(`/athlete/${ATHLETE_ID}/wellness?${params}`);
-    const entries = Array.isArray(data) ? data : [];
-    if (entries.length === 0) return { content: [{ type: "text", text: "No fitness data found." }] };
+    try {
+      const today = new Date().toISOString().split("T")[0];
+      const sixWeeksAgo = new Date(Date.now() - 42 * 86400000).toISOString().split("T")[0];
+      const params = new URLSearchParams({
+        oldest: start_date || sixWeeksAgo,
+        newest: end_date || today,
+      });
+      const data = await callIntervals(`/athlete/${ATHLETE_ID}/wellness?${params}`);
 
-    const recent = entries.slice(-7);
-    const summary = recent.map((d) => {
-      const lines = [
-        `📅 ${d.id}`,
-        d.ctl != null ? `   📈 CTL (Fitness): ${d.ctl?.toFixed(1)}` : null,
-        d.atl != null ? `   📉 ATL (Fatigue): ${d.atl?.toFixed(1)}` : null,
-        d.tsb != null ? `   ⚖️  TSB (Form): ${d.tsb?.toFixed(1)}` : null,
-      ].filter(Boolean);
-      return lines.join("\n");
-    });
+      // Handle both plain array and wrapped responses
+      let entries = [];
+      if (Array.isArray(data)) {
+        entries = data;
+      } else if (data && Array.isArray(data.wellness)) {
+        entries = data.wellness;
+      }
 
-    const latest = entries[entries.length - 1];
-    const header = `📊 FITNESS SUMMARY (last 6 weeks)\n${"─".repeat(40)}\nLatest values:\n   CTL: ${latest?.ctl?.toFixed(1) ?? "N/A"} | ATL: ${latest?.atl?.toFixed(1) ?? "N/A"} | TSB: ${latest?.tsb?.toFixed(1) ?? "N/A"}\n\nLast 7 days:\n`;
+      if (entries.length === 0) {
+        return { content: [{ type: "text", text: "No fitness data found. Make sure your training load is being calculated in intervals.icu." }] };
+      }
 
-    return { content: [{ type: "text", text: header + summary.join("\n\n") }] };
+      // Filter only entries that have at least one fitness metric
+      const withFitness = entries.filter(d => d.ctl != null || d.atl != null || d.tsb != null);
+
+      const fmt = (val) => (val != null && !isNaN(val)) ? Number(val).toFixed(1) : "N/A";
+
+      if (withFitness.length === 0) {
+        // Return raw wellness data so we can at least see what fields exist
+        const latest = entries[entries.length - 1];
+        const fields = Object.keys(latest || {}).join(", ");
+        return { content: [{ type: "text", text: `⚠️ No CTL/ATL/TSB data found yet. Available fields: ${fields}\n\nMake sure Training Load is enabled in intervals.icu settings.` }] };
+      }
+
+      const recent = withFitness.slice(-7);
+      const summary = recent.map((d) => {
+        const lines = [
+          `📅 ${d.id}`,
+          d.ctl != null ? `   📈 CTL (Fitness): ${fmt(d.ctl)}` : null,
+          d.atl != null ? `   📉 ATL (Fatigue): ${fmt(d.atl)}` : null,
+          d.tsb != null ? `   ⚖️  TSB (Form): ${fmt(d.tsb)}` : null,
+        ].filter(Boolean);
+        return lines.join("\n");
+      });
+
+      const latest = withFitness[withFitness.length - 1];
+      const header = `📊 FITNESS SUMMARY (last 6 weeks)\n${"─".repeat(40)}\nLatest values:\n   CTL: ${fmt(latest?.ctl)} | ATL: ${fmt(latest?.atl)} | TSB: ${fmt(latest?.tsb)}\n\nLast 7 days with data:\n`;
+
+      return { content: [{ type: "text", text: header + summary.join("\n\n") }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `❌ Error fetching fitness data: ${err.message}` }] };
+    }
   }
 );
 
