@@ -144,13 +144,24 @@ function createServer() {
     { activity_id: z.string().describe("Activity ID") },
     async ({ activity_id }) => {
       try {
-        const data = await callIntervals(`/athlete/${ATHLETE_ID}/activities/${activity_id}`);
+        // intervals.icu activity IDs can have 'i' prefix — strip it for the API call
+        const cleanId = activity_id.replace(/^i/, "");
+        const data = await callIntervals(`/athlete/${ATHLETE_ID}/activities/${cleanId}`);
         const a    = data.activity || data;
+
+        // Debug: if name is undefined, dump raw keys
+        if (!a.name && !a.start_date_local) {
+          return { content: [{ type: "text", text: `⚠️ Unexpected response. Keys: ${Object.keys(data).join(", ")}\nRaw: ${JSON.stringify(data).slice(0, 500)}` }] };
+        }
+
         const lines = [
           `📊 ${(a.start_date_local || "").split("T")[0]} — ${a.name} (${a.type})`,
           `⏱ ${fmtDuration(a.moving_time)}  📏 ${((a.distance || 0) / 1000).toFixed(2)} km`,
           a.average_heartrate ? `❤️  Avg ${fmt0(a.average_heartrate)} / Max ${fmt0(a.max_heartrate)} bpm` : null,
           a.average_speed     ? `🏃 ${fmtPace(a.average_speed)}` : null,
+          a.average_cadence   ? `👟 Cadencia media: ${fmt0(a.average_cadence)} spm` : null,
+          a.average_watts     ? `⚡ Potencia media: ${fmt0(a.average_watts)} W` : null,
+          a.total_elevation_gain ? `⛰️  Desnivel+: ${fmt0(a.total_elevation_gain)} m` : null,
           a.tss               ? `📊 TSS ${fmt0(a.tss)}` : null,
           a.calories          ? `🔥 ${fmt0(a.calories)} kcal` : null,
           a.perceived_exertion ? `😓 RPE ${a.perceived_exertion}/10` : null,
