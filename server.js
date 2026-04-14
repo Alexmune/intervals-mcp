@@ -506,17 +506,10 @@ app.use((req, res, next) => {
 const transports = {};
 
 app.get("/sse", async (req, res) => {
-  // Proper SSE headers — disable buffering so Railway doesn't buffer the stream
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache, no-transform");
-  res.setHeader("Connection", "keep-alive");
-  res.setHeader("X-Accel-Buffering", "no");
-  res.flushHeaders();
-
   const transport = new SSEServerTransport("/messages", res);
   transports[transport.sessionId] = transport;
   res.on("close", () => {
-    console.log(`SSE session closed: ${transport.sessionId}`);
+    console.log(`SSE closed: ${transport.sessionId}`);
     delete transports[transport.sessionId];
   });
   console.log(`New SSE connection: ${transport.sessionId}`);
