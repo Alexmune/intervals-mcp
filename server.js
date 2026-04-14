@@ -144,14 +144,20 @@ function createServer() {
     { activity_id: z.string().describe("Activity ID") },
     async ({ activity_id }) => {
       try {
-        // intervals.icu activity IDs can have 'i' prefix — strip it for the API call
-        const cleanId = activity_id.replace(/^i/, "");
-        const data = await callIntervals(`/athlete/${ATHLETE_ID}/activities/${cleanId}`);
-        const a    = data.activity || data;
+        // Try with original ID first, then without 'i' prefix
+        let data;
+        try {
+          data = await callIntervals(`/athlete/${ATHLETE_ID}/activities/${activity_id}`);
+        } catch (e1) {
+          const cleanId = activity_id.replace(/^i/, "");
+          data = await callIntervals(`/athlete/${ATHLETE_ID}/activities/${cleanId}`);
+        }
 
-        // Debug: if name is undefined, dump raw keys
-        if (!a.name && !a.start_date_local) {
-          return { content: [{ type: "text", text: `⚠️ Unexpected response. Keys: ${Object.keys(data).join(", ")}\nRaw: ${JSON.stringify(data).slice(0, 500)}` }] };
+        // intervals.icu single activity might return an array or object
+        const a = Array.isArray(data) ? data[0] : (data.activity || data);
+
+        if (!a || (!a.name && !a.start_date_local && !a.distance)) {
+          return { content: [{ type: "text", text: `⚠️ No data. Response type: ${typeof data}, keys: ${Object.keys(data||{}).join(", ")}, raw: ${JSON.stringify(data).slice(0,300)}` }] };
         }
 
         const lines = [
