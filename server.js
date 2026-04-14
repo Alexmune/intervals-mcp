@@ -494,15 +494,34 @@ server.tool(
 const app = express();
 app.use(express.json());
 
+// CORS — allow Claude.ai and any origin to connect
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept");
+  if (req.method === "OPTIONS") { res.sendStatus(200); return; }
+  next();
+});
+
 const transports = {};
 
 app.get("/sse", async (req, res) => {
+  // Proper SSE headers — disable buffering so Railway doesn't buffer the stream
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders();
+
   const transport = new SSEServerTransport("/messages", res);
   transports[transport.sessionId] = transport;
-  res.on("close", () => delete transports[transport.sessionId]);
-  // Create a fresh McpServer instance per connection to avoid "already connected" error
-  const server = createServer();
-  await server.connect(transport);
+  res.on("close", () => {
+    console.log(`SSE session closed: ${transport.sessionId}`);
+    delete transports[transport.sessionId];
+  });
+  console.log(`New SSE connection: ${transport.sessionId}`);
+  const mcpServer = createServer();
+  await mcpServer.connect(transport);
 });
 
 app.post("/messages", async (req, res) => {
