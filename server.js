@@ -157,19 +157,61 @@ function createServer() {
     {},
     async () => {
       try {
-        const data = await callIntervals(`/athlete/${ATHLETE_ID}/settings`);
+        // Try different endpoints for settings/zones
+        let data;
+        try {
+          data = await callIntervals(`/athlete/${ATHLETE_ID}/config`);
+        } catch (_) {
+          try {
+            data = await callIntervals(`/athlete/${ATHLETE_ID}/sports-settings`);
+          } catch (_) {
+            data = await callIntervals(`/athlete/${ATHLETE_ID}`);
+          }
+        }
+
         if (!data || typeof data !== "object") {
           return { content: [{ type: "text", text: "No settings data available." }] };
         }
+
+        const d = data.athlete || data;
         const lines = [`⚙️ CONFIGURACIÓN DEL ATLETA\n`];
-        // Dump all settings - structure varies per athlete
-        const dump = JSON.stringify(data, null, 2);
-        // If too long, truncate intelligently
-        if (dump.length > 3000) {
-          lines.push(dump.slice(0, 3000) + "\n... (truncado)");
-        } else {
-          lines.push(dump);
+
+        // HR zones
+        const hrZones = d.hrZones || d.heartRateZones || d.hr_zones || [];
+        if (hrZones.length) {
+          lines.push(`❤️  ZONAS FC`);
+          hrZones.forEach((z, i) => {
+            const from = z.min ?? z.from ?? z.low ?? "";
+            const to   = z.max ?? z.to   ?? z.high ?? "";
+            const name = z.name || z.label || `Z${i+1}`;
+            lines.push(`   ${name}: ${from}–${to} bpm`);
+          });
+          lines.push("");
         }
+
+        // Pace zones
+        const paceZones = d.paceZones || d.pace_zones || [];
+        if (paceZones.length) {
+          lines.push(`🏃 ZONAS RITMO`);
+          paceZones.forEach((z, i) => {
+            lines.push(`   Z${i+1}: ${z.min || z.from || ""}–${z.max || z.to || ""} min/km`);
+          });
+          lines.push("");
+        }
+
+        // FTP / thresholds
+        if (d.ftp || d.lthr || d.runningFTP || d.maxHR) {
+          lines.push(`📊 UMBRALES`);
+          if (d.maxHR)      lines.push(`   FC máxima: ${d.maxHR} bpm`);
+          if (d.lthr)       lines.push(`   LTHR: ${d.lthr} bpm`);
+          if (d.ftp)        lines.push(`   FTP ciclismo: ${d.ftp} W`);
+          if (d.runningFTP) lines.push(`   FTP running: ${d.runningFTP}`);
+        }
+
+        if (lines.length <= 2) {
+          lines.push(`Campos disponibles: ${Object.keys(d).join(", ")}`);
+        }
+
         return { content: [{ type: "text", text: lines.join("\n") }] };
       } catch (err) {
         return { content: [{ type: "text", text: `❌ get_athlete_settings: ${err.message}` }] };
@@ -446,34 +488,72 @@ function createServer() {
         const range  = safeRange(start_date || daysAgo(14), end_date, 180);
         const params = new URLSearchParams({ oldest: range.oldest, newest: range.newest });
         const data   = await callIntervals(`/athlete/${ATHLETE_ID}/wellness?${params}`);
+        // No filter — show all entries that have ANY non-null value
         const entries = toArray(data, "wellness").filter(w =>
-          w.hrv || w.restingHR || w.sleepSecs || w.weight || w.steps ||
-          w.calories || w.bodyBattery || w.stress || w.spO2 || w.respiration ||
-          w.fatigue != null || w.mood != null || w.motivation != null
+          Object.values(w).some(v => v != null && v !== w.id)
         );
         if (!entries.length) return { content: [{ type: "text", text: "No wellness data in range." }] };
-        const lines = entries.map(w => [
-          `📅 ${w.id}`,
-          w.hrv          ? `   💓 HRV: ${w.hrv}` : null,
-          w.restingHR    ? `   ❤️  FC reposo: ${w.restingHR} bpm` : null,
-          w.sleepSecs    ? `   😴 Sueño: ${(w.sleepSecs/3600).toFixed(1)}h` : null,
-          w.sleepScore   ? `   💤 Calidad sueño: ${w.sleepScore}/100` : null,
-          w.steps        ? `   👣 Pasos: ${w.steps.toLocaleString()}` : null,
-          w.calories     ? `   🔥 Calorías totales: ${w.calories} kcal` : null,
-          w.weight       ? `   ⚖️  Peso: ${w.weight} kg` : null,
-          w.bodyBattery  ? `   🔋 Body Battery: ${w.bodyBattery}` : null,
-          w.stress       ? `   😰 Estrés: ${w.stress}` : null,
-          w.spO2         ? `   🫁 SpO2: ${w.spO2}%` : null,
-          w.respiration  ? `   💨 Respiración: ${w.respiration} rpm` : null,
-          w.fatigue      != null ? `   😩 Fatiga: ${w.fatigue}/10` : null,
-          w.mood         != null ? `   😊 Estado de ánimo: ${w.mood}/10` : null,
-          w.motivation   != null ? `   🔥 Motivación: ${w.motivation}/10` : null,
-          w.soreness     != null ? `   💪 Agujetas: ${w.soreness}/10` : null,
-          w.notes        ? `   📝 ${w.notes}` : null,
-        ].filter(Boolean).join("\n"));
+
+        // Known display fields
+        const lines = entries.map(w => {
+          const known = [
+            `📅 ${w.id}`,
+            w.hrv          ? `   💓 HRV: ${w.hrv}` : null,
+            w.restingHR    ? `   ❤️  FC reposo: ${w.restingHR} bpm` : null,
+            w.sleepSecs    ? `   😴 Sueño: ${(w.sleepSecs/3600).toFixed(1)}h` : null,
+            w.sleepScore   ? `   💤 Calidad sueño: ${w.sleepScore}/100` : null,
+            w.steps        ? `   👣 Pasos: ${w.steps.toLocaleString()}` : null,
+            w.calories     ? `   🔥 Calorías: ${w.calories} kcal` : null,
+            w.weight       ? `   ⚖️  Peso: ${w.weight} kg` : null,
+            w.vo2max       ? `   🫁 VO2max: ${w.vo2max}` : null,
+            w.bodyBattery  ? `   🔋 Body Battery: ${w.bodyBattery}` : null,
+            w.avgBodyBattery ? `   🔋 Body Battery media: ${w.avgBodyBattery}` : null,
+            w.stress       ? `   😰 Estrés: ${w.stress}` : null,
+            w.avgStress    ? `   😰 Estrés medio: ${w.avgStress}` : null,
+            w.spO2         ? `   🫁 SpO2: ${w.spO2}%` : null,
+            w.respiration  ? `   💨 Respiración: ${w.respiration} rpm` : null,
+            w.menstrualCyclePhase ? `   🔴 Ciclo: ${w.menstrualCyclePhase}` : null,
+            w.fatigue      != null ? `   😩 Fatiga: ${w.fatigue}/10` : null,
+            w.mood         != null ? `   😊 Ánimo: ${w.mood}/10` : null,
+            w.motivation   != null ? `   🔥 Motivación: ${w.motivation}/10` : null,
+            w.soreness     != null ? `   💪 Agujetas: ${w.soreness}/10` : null,
+            w.notes        ? `   📝 ${w.notes}` : null,
+          ].filter(Boolean);
+
+          // Dump any extra fields not in the known list
+          const knownKeys = new Set(["id","hrv","restingHR","sleepSecs","sleepScore","steps","calories","weight","vo2max","bodyBattery","avgBodyBattery","stress","avgStress","spO2","respiration","fatigue","mood","motivation","soreness","notes","ctl","atl","tsb","menstrualCyclePhase"]);
+          const extras = Object.entries(w)
+            .filter(([k, v]) => !knownKeys.has(k) && v != null)
+            .map(([k, v]) => `   📌 ${k}: ${v}`);
+          if (extras.length) known.push(...extras);
+
+          return known.join("\n");
+        });
         return { content: [{ type: "text", text: lines.join("\n\n") }] };
       } catch (err) {
         return { content: [{ type: "text", text: `❌ get_wellness: ${err.message}` }] };
+      }
+    }
+  );
+
+  srv.tool("get_wellness_raw",
+    "Dump ALL raw fields from a single wellness entry to discover available data. Use to debug missing fields like VO2max.",
+    { date: z.string().optional().describe("Date YYYY-MM-DD (default: today)") },
+    async ({ date }) => {
+      try {
+        const d      = date || today();
+        const params = new URLSearchParams({ oldest: d, newest: d });
+        const data   = await callIntervals(`/athlete/${ATHLETE_ID}/wellness?${params}`);
+        const entries = toArray(data, "wellness");
+        if (!entries.length) return { content: [{ type: "text", text: `No wellness entry for ${d}` }] };
+        const entry = entries[0];
+        const lines = [`🔍 RAW WELLNESS — ${entry.id}\n`];
+        Object.entries(entry)
+          .filter(([, v]) => v != null)
+          .forEach(([k, v]) => lines.push(`  ${k}: ${JSON.stringify(v)}`));
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      } catch (err) {
+        return { content: [{ type: "text", text: `❌ get_wellness_raw: ${err.message}` }] };
       }
     }
   );
@@ -615,6 +695,98 @@ function createServer() {
         return { content: [{ type: "text", text: lines.join("\n") }] };
       } catch (err) {
         return { content: [{ type: "text", text: `❌ get_event_by_id: ${err.message}` }] };
+      }
+    }
+  );
+
+  srv.tool("get_records",
+    "Get athlete personal records and best efforts (fastest times, longest distances, etc.)",
+    {},
+    async () => {
+      try {
+        const data = await callIntervals(`/athlete/${ATHLETE_ID}/records`);
+        if (!data || typeof data !== "object") {
+          return { content: [{ type: "text", text: "No records data." }] };
+        }
+        const lines = [`🏆 RÉCORDS PERSONALES\n`];
+        // Records can be nested by sport or flat
+        const processRecords = (obj, prefix = "") => {
+          if (Array.isArray(obj)) {
+            obj.forEach(r => {
+              const name = r.name || r.distance || r.label || "";
+              const val  = r.value || r.time || r.pace || "";
+              const date = r.date || r.activity_date || "";
+              if (name && val) lines.push(`  ${prefix}${name}: ${val}${date ? ` (${date})` : ""}`);
+            });
+          } else if (typeof obj === "object") {
+            Object.entries(obj).forEach(([k, v]) => {
+              if (typeof v === "object" && v !== null) {
+                lines.push(`\n  📌 ${k}:`);
+                processRecords(v, "    ");
+              } else if (v != null) {
+                lines.push(`  ${prefix}${k}: ${v}`);
+              }
+            });
+          }
+        };
+        processRecords(data);
+        if (lines.length <= 2) lines.push("No personal records found.");
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      } catch (err) {
+        return { content: [{ type: "text", text: `❌ get_records: ${err.message}` }] };
+      }
+    }
+  );
+
+  srv.tool("get_training_load",
+    "Get detailed training load history: CTL, ATL, TSB, rampRate, fitness trend over the last months.",
+    {
+      weeks: z.number().optional().describe("Weeks of history (default: 16, max: 52)"),
+    },
+    async ({ weeks = 16 }) => {
+      try {
+        const safeWeeks = Math.min(weeks, 52);
+        const params = new URLSearchParams({ oldest: daysAgo(safeWeeks * 7), newest: today() });
+        const data   = await callIntervals(`/athlete/${ATHLETE_ID}/wellness?${params}`);
+        const entries = toArray(data, "wellness").filter(d => d.ctl != null || d.atl != null);
+        if (!entries.length) return { content: [{ type: "text", text: "No training load data." }] };
+
+        // Weekly summary of load
+        const weeks_map = {};
+        entries.forEach(d => {
+          const dt  = new Date(d.id);
+          const day = dt.getDay();
+          const mon = new Date(dt);
+          mon.setDate(dt.getDate() + (day === 0 ? -6 : 1 - day));
+          const key = mon.toISOString().split("T")[0];
+          if (!weeks_map[key]) weeks_map[key] = { entries: [] };
+          weeks_map[key].entries.push(d);
+        });
+
+        const latest = entries[entries.length - 1];
+        const tsbNow = latest.tsb != null ? latest.tsb : (latest.ctl - latest.atl);
+        const lines = [
+          `📊 CARGA DE ENTRENAMIENTO — ${safeWeeks} semanas`,
+          ``,
+          `Hoy (${latest.id}):`,
+          `   CTL: ${fmt1(latest.ctl)} | ATL: ${fmt1(latest.atl)} | TSB: ${fmt1(tsbNow)}`,
+          `   Estado: ${tsbNow > 5 ? "🟢 Fresco" : tsbNow > -10 ? "🟡 Óptimo" : tsbNow > -25 ? "🟠 Cansado" : "🔴 Sobreentrenamiento"}`,
+          ``,
+          `Tendencia semanal (fin de semana):`,
+        ];
+
+        Object.entries(weeks_map)
+          .sort((a, b) => a[0].localeCompare(b[0]))
+          .forEach(([weekStart, { entries: wEntries }]) => {
+            const last = wEntries[wEntries.length - 1];
+            const tsb  = last.tsb != null ? last.tsb : (last.ctl - last.atl);
+            const trend = tsb > 5 ? "🟢" : tsb > -10 ? "🟡" : tsb > -25 ? "🟠" : "🔴";
+            lines.push(`  ${weekStart}  CTL ${fmt1(last.ctl).padStart(5)}  ATL ${fmt1(last.atl).padStart(5)}  TSB ${fmt1(tsb).padStart(6)} ${trend}`);
+          });
+
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      } catch (err) {
+        return { content: [{ type: "text", text: `❌ get_training_load: ${err.message}` }] };
       }
     }
   );
