@@ -799,74 +799,41 @@ function createServer() {
     { sport: z.string().optional().describe("Sport type: Run, Ride, Swim (default: Run)") },
     async ({ sport = "Run" }) => {
       try {
-        // Try multiple possible endpoints for sport settings
-        const endpoints = [
-          `/athlete/${ATHLETE_ID}/sportssettings`,
-          `/athlete/${ATHLETE_ID}/sport-settings`,
-          `/athlete/${ATHLETE_ID}/sport/${sport}/settings`,
-          `/athlete/${ATHLETE_ID}/config/${sport}`,
-        ];
+        const data = await callIntervals(`/athlete/${ATHLETE_ID}/sport-settings`);
+        const configs = Array.isArray(data) ? data : [data];
 
-        let data = null;
-        let usedEndpoint = "";
-        for (const ep of endpoints) {
-          try {
-            data = await callIntervals(ep);
-            usedEndpoint = ep;
-            break;
-          } catch (_) {}
-        }
+        const lines = [`⚙️ CONFIGURACIÓN POR DEPORTE\n`];
 
-        // Fallback: get from athlete profile
-        if (!data) {
-          data = await callIntervals(`/athlete/${ATHLETE_ID}`);
-          usedEndpoint = "athlete profile (fallback)";
-        }
+        configs.forEach((cfg, idx) => {
+          const sports = cfg.types || [];
+          const isRunning = sports.some(t => t.toLowerCase().includes("run"));
+          const isCycling = sports.some(t => t.toLowerCase().includes("ride"));
+          const sportName = isRunning ? "🏃 RUNNING" : isCycling ? "🚴 CICLISMO" : `DEPORTE ${idx+1}`;
 
-        const d = data.athlete || data;
-        const lines = [`⚙️ CONFIGURACIÓN DEPORTE: ${sport} (endpoint: ${usedEndpoint})\n`];
+          lines.push(`${sportName} (${sports.join(", ")})`);
 
-        // Threshold / CS
-        if (d.threshold_pace || d.runningFTP || d.criticalSpeed || d.cs) {
-          lines.push(`🏃 VELOCIDAD CRÍTICA / UMBRAL`);
-          if (d.threshold_pace) lines.push(`   Ritmo umbral: ${d.threshold_pace}`);
-          if (d.runningFTP)     lines.push(`   Running FTP: ${d.runningFTP}`);
-          if (d.criticalSpeed)  lines.push(`   CS: ${d.criticalSpeed}`);
-          if (d.dPrime || d.d_prime) lines.push(`   D': ${d.dPrime || d.d_prime} m`);
+          if (cfg.lthr)  lines.push(`   ❤️  LTHR: ${cfg.lthr} bpm`);
+          if (cfg.max_hr) lines.push(`   💓 FC máx: ${cfg.max_hr} bpm`);
+          if (cfg.ftp)   lines.push(`   ⚡ FTP: ${cfg.ftp} W`);
+          if (cfg.threshold_pace) lines.push(`   🏃 Ritmo umbral (CS): ${cfg.threshold_pace}`);
+          if (cfg.w_prime) lines.push(`   🔋 W' / D': ${cfg.w_prime}`);
+
+          // HR zones
+          const hrz = cfg.hr_zones || [];
+          const hzn = cfg.hr_zone_names || [];
+          if (hrz.length) {
+            lines.push(`   Zonas FC: ${hrz.map((v, i) => `${hzn[i]||`Z${i+1}`}≤${v}`).join(" | ")}`);
+          }
+
+          // Pace zones
+          const paz = cfg.pace_zones || [];
+          const pzn = cfg.pace_zone_names || [];
+          if (paz.length) {
+            lines.push(`   Zonas ritmo: ${paz.map((v, i) => `${pzn[i]||`Z${i+1}`}≤${v}`).join(" | ")}`);
+          }
+
           lines.push("");
-        }
-
-        // HR zones
-        const hrZones = d.hrZones || d.heartRateZones || d.hr_zones || [];
-        if (hrZones.length) {
-          lines.push(`❤️  ZONAS FC`);
-          hrZones.forEach((z, i) => {
-            const from = z.min ?? z.from ?? z.low ?? 0;
-            const to   = z.max ?? z.to   ?? z.high ?? "";
-            const name = z.name || z.label || `Z${i+1}`;
-            lines.push(`   ${name} (Z${i+1}): ${from}–${to} bpm`);
-          });
-          lines.push("");
-        }
-
-        // Pace zones
-        const paceZones = d.paceZones || d.pace_zones || [];
-        if (paceZones.length) {
-          lines.push(`🏃 ZONAS RITMO`);
-          paceZones.forEach((z, i) => {
-            const from = z.min || z.from || z.low || "";
-            const to   = z.max || z.to   || z.high || "";
-            const name = z.name || z.label || `Z${i+1}`;
-            lines.push(`   ${name} (Z${i+1}): ${from}–${to} min/km`);
-          });
-          lines.push("");
-        }
-
-        if (lines.length <= 2) {
-          // Dump everything raw
-          const dump = JSON.stringify(d, null, 2).slice(0, 2000);
-          lines.push(`Raw response:\n${dump}`);
-        }
+        });
 
         return { content: [{ type: "text", text: lines.join("\n") }] };
       } catch (err) {
@@ -880,35 +847,65 @@ function createServer() {
     { sport: z.string().optional().describe("Sport: Run, Ride (default: Run)") },
     async ({ sport = "Run" }) => {
       try {
-        // Try pace/power curve endpoints
-        const endpoints = [
-          `/athlete/${ATHLETE_ID}/pace-curve?type=${sport}`,
-          `/athlete/${ATHLETE_ID}/fitness-chart?type=${sport}`,
-          `/athlete/${ATHLETE_ID}/best-efforts?type=${sport}`,
-          `/athlete/${ATHLETE_ID}/mmp?type=${sport}`,
-          `/athlete/${ATHLETE_ID}/records?type=${sport}`,
+        const lines = [`📈 DATOS DE RENDIMIENTO — ${sport}\n`];
+
+        // 1. Try pace/power curve — correct intervals endpoint
+        const curveEndpoints = [
+          `/athlete/${ATHLETE_ID}/power-curves?type=${sport}&curves=mmp`,
+          `/athlete/${ATHLETE_ID}/power-curves?type=${sport}`,
+          `/athlete/${ATHLETE_ID}/pace-zones?type=${sport}`,
         ];
 
-        const results = [];
-        for (const ep of endpoints) {
+        for (const ep of curveEndpoints) {
           try {
             const d = await callIntervals(ep);
             if (d && (Array.isArray(d) ? d.length > 0 : Object.keys(d).length > 0)) {
-              results.push({ endpoint: ep, data: d });
+              lines.push(`✅ ${ep}`);
+              lines.push(JSON.stringify(d, null, 2).slice(0, 1000));
+              lines.push("");
             }
-          } catch (_) {}
+          } catch (e) {
+            lines.push(`❌ ${ep}: ${e.message.slice(0, 80)}`);
+          }
         }
 
-        if (!results.length) {
-          return { content: [{ type: "text", text: "No performance curve data found. Endpoints probados: " + endpoints.join(", ") }] };
-        }
-
-        const lines = [`📈 DATOS DE RENDIMIENTO — ${sport}\n`];
-        results.forEach(({ endpoint, data }) => {
-          lines.push(`\n✅ ${endpoint}`);
-          const dump = JSON.stringify(data, null, 2).slice(0, 1500);
-          lines.push(dump);
+        // 2. Try getting best efforts from activities with pace fields
+        const params = new URLSearchParams({
+          oldest: daysAgo(90),
+          newest: today(),
+          fields: "id,name,type,start_date_local,distance,average_speed,icu_best_efforts,icu_wo_defs"
         });
+        try {
+          const actData = await callIntervals(`/athlete/${ATHLETE_ID}/activities?${params}`);
+          const acts = toArray(actData, "activities").filter(a =>
+            (a.type || "").toLowerCase().includes("run") &&
+            (a.icu_best_efforts || a.icu_wo_defs)
+          );
+          if (acts.length) {
+            lines.push(`\n🏆 MEJORES ESFUERZOS (${acts.length} actividades con datos)`);
+            acts.slice(0, 3).forEach(a => {
+              lines.push(`  ${(a.start_date_local||"").split("T")[0]} — ${a.name}`);
+              if (a.icu_best_efforts) lines.push(`    best_efforts: ${JSON.stringify(a.icu_best_efforts).slice(0,200)}`);
+            });
+          }
+        } catch (_) {}
+
+        // 3. Get CS/D' from sport settings
+        try {
+          const ss = await callIntervals(`/athlete/${ATHLETE_ID}/sport-settings`);
+          const configs = Array.isArray(ss) ? ss : [ss];
+          const runConfig = configs.find(c => (c.types||[]).some(t => t.toLowerCase().includes("run")));
+          if (runConfig?.threshold_pace || runConfig?.w_prime) {
+            lines.push(`\n🎯 VELOCIDAD CRÍTICA (sport-settings)`);
+            if (runConfig.threshold_pace) lines.push(`   CS (ritmo umbral): ${runConfig.threshold_pace}`);
+            if (runConfig.w_prime)        lines.push(`   D' (W'): ${runConfig.w_prime}`);
+          } else {
+            lines.push(`\nℹ️  CS/D' no configurados en sport-settings de running.`);
+            lines.push(`   Los valores que ves en intervals (CS 4:06, D' 116.4m) son calculados`);
+            lines.push(`   automáticamente por intervals a partir de tus mejores esfuerzos`);
+            lines.push(`   pero no se exponen directamente en la API pública.`);
+          }
+        } catch (_) {}
 
         return { content: [{ type: "text", text: lines.join("\n") }] };
       } catch (err) {
