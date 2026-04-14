@@ -502,10 +502,12 @@ function createServer() {
             w.restingHR    ? `   ❤️  FC reposo: ${w.restingHR} bpm` : null,
             w.sleepSecs    ? `   😴 Sueño: ${(w.sleepSecs/3600).toFixed(1)}h` : null,
             w.sleepScore   ? `   💤 Calidad sueño: ${w.sleepScore}/100` : null,
+            w.sleepQuality != null ? `   💤 Calidad (1-5): ${w.sleepQuality}/5` : null,
             w.steps        ? `   👣 Pasos: ${w.steps.toLocaleString()}` : null,
             w.calories     ? `   🔥 Calorías: ${w.calories} kcal` : null,
             w.weight       ? `   ⚖️  Peso: ${w.weight} kg` : null,
             w.vo2max       ? `   🫁 VO2max: ${w.vo2max}` : null,
+            w.rampRate     != null ? `   📈 Ramp rate CTL: ${Number(w.rampRate).toFixed(2)}/semana` : null,
             w.bodyBattery  ? `   🔋 Body Battery: ${w.bodyBattery}` : null,
             w.avgBodyBattery ? `   🔋 Body Battery media: ${w.avgBodyBattery}` : null,
             w.stress       ? `   😰 Estrés: ${w.stress}` : null,
@@ -521,7 +523,7 @@ function createServer() {
           ].filter(Boolean);
 
           // Dump any extra fields not in the known list
-          const knownKeys = new Set(["id","hrv","restingHR","sleepSecs","sleepScore","steps","calories","weight","vo2max","bodyBattery","avgBodyBattery","stress","avgStress","spO2","respiration","fatigue","mood","motivation","soreness","notes","ctl","atl","tsb","menstrualCyclePhase"]);
+          const knownKeys = new Set(["id","hrv","restingHR","sleepSecs","sleepScore","sleepQuality","steps","calories","weight","vo2max","rampRate","ctlLoad","atlLoad","sportInfo","bodyBattery","avgBodyBattery","stress","avgStress","spO2","respiration","fatigue","mood","motivation","soreness","notes","ctl","atl","tsb","menstrualCyclePhase","updated","tempWeight","tempRestingHR"]);
           const extras = Object.entries(w)
             .filter(([k, v]) => !knownKeys.has(k) && v != null)
             .map(([k, v]) => `   📌 ${k}: ${v}`);
@@ -584,6 +586,7 @@ function createServer() {
           `   CTL (Forma crónica): ${fmt1(latest.ctl)}`,
           `   ATL (Fatiga aguda):  ${fmt1(latest.atl)}`,
           `   TSB (Frescura):      ${tsbLatest != null ? fmt1(tsbLatest) : "N/A"}`,
+          latest.rampRate != null ? `   Ramp rate:           ${Number(latest.rampRate).toFixed(2)}/semana` : null,
           tsbLatest != null ? `   Estado: ${tsbLatest > 5 ? "🟢 Fresco" : tsbLatest > -10 ? "🟡 Óptimo" : tsbLatest > -25 ? "🟠 Cansado" : "🔴 Sobreentrenamiento"}` : null,
           `\nÚltimos ${Math.min(withLoad.length, 14)} días:`,
         ].filter(Boolean).join("\n");
