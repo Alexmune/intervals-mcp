@@ -794,6 +794,129 @@ function createServer() {
     }
   );
 
+  srv.tool("get_sport_settings",
+    "Get sport-specific settings: HR zones, pace zones, Critical Speed (CS), D prime, thresholds for running, cycling, swimming.",
+    { sport: z.string().optional().describe("Sport type: Run, Ride, Swim (default: Run)") },
+    async ({ sport = "Run" }) => {
+      try {
+        // Try multiple possible endpoints for sport settings
+        const endpoints = [
+          `/athlete/${ATHLETE_ID}/sportssettings`,
+          `/athlete/${ATHLETE_ID}/sport-settings`,
+          `/athlete/${ATHLETE_ID}/sport/${sport}/settings`,
+          `/athlete/${ATHLETE_ID}/config/${sport}`,
+        ];
+
+        let data = null;
+        let usedEndpoint = "";
+        for (const ep of endpoints) {
+          try {
+            data = await callIntervals(ep);
+            usedEndpoint = ep;
+            break;
+          } catch (_) {}
+        }
+
+        // Fallback: get from athlete profile
+        if (!data) {
+          data = await callIntervals(`/athlete/${ATHLETE_ID}`);
+          usedEndpoint = "athlete profile (fallback)";
+        }
+
+        const d = data.athlete || data;
+        const lines = [`⚙️ CONFIGURACIÓN DEPORTE: ${sport} (endpoint: ${usedEndpoint})\n`];
+
+        // Threshold / CS
+        if (d.threshold_pace || d.runningFTP || d.criticalSpeed || d.cs) {
+          lines.push(`🏃 VELOCIDAD CRÍTICA / UMBRAL`);
+          if (d.threshold_pace) lines.push(`   Ritmo umbral: ${d.threshold_pace}`);
+          if (d.runningFTP)     lines.push(`   Running FTP: ${d.runningFTP}`);
+          if (d.criticalSpeed)  lines.push(`   CS: ${d.criticalSpeed}`);
+          if (d.dPrime || d.d_prime) lines.push(`   D': ${d.dPrime || d.d_prime} m`);
+          lines.push("");
+        }
+
+        // HR zones
+        const hrZones = d.hrZones || d.heartRateZones || d.hr_zones || [];
+        if (hrZones.length) {
+          lines.push(`❤️  ZONAS FC`);
+          hrZones.forEach((z, i) => {
+            const from = z.min ?? z.from ?? z.low ?? 0;
+            const to   = z.max ?? z.to   ?? z.high ?? "";
+            const name = z.name || z.label || `Z${i+1}`;
+            lines.push(`   ${name} (Z${i+1}): ${from}–${to} bpm`);
+          });
+          lines.push("");
+        }
+
+        // Pace zones
+        const paceZones = d.paceZones || d.pace_zones || [];
+        if (paceZones.length) {
+          lines.push(`🏃 ZONAS RITMO`);
+          paceZones.forEach((z, i) => {
+            const from = z.min || z.from || z.low || "";
+            const to   = z.max || z.to   || z.high || "";
+            const name = z.name || z.label || `Z${i+1}`;
+            lines.push(`   ${name} (Z${i+1}): ${from}–${to} min/km`);
+          });
+          lines.push("");
+        }
+
+        if (lines.length <= 2) {
+          // Dump everything raw
+          const dump = JSON.stringify(d, null, 2).slice(0, 2000);
+          lines.push(`Raw response:\n${dump}`);
+        }
+
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      } catch (err) {
+        return { content: [{ type: "text", text: `❌ get_sport_settings: ${err.message}` }] };
+      }
+    }
+  );
+
+  srv.tool("get_performance_data",
+    "Get performance curves: Critical Speed, D prime, best efforts at different distances, pace curve data.",
+    { sport: z.string().optional().describe("Sport: Run, Ride (default: Run)") },
+    async ({ sport = "Run" }) => {
+      try {
+        // Try pace/power curve endpoints
+        const endpoints = [
+          `/athlete/${ATHLETE_ID}/pace-curve?type=${sport}`,
+          `/athlete/${ATHLETE_ID}/fitness-chart?type=${sport}`,
+          `/athlete/${ATHLETE_ID}/best-efforts?type=${sport}`,
+          `/athlete/${ATHLETE_ID}/mmp?type=${sport}`,
+          `/athlete/${ATHLETE_ID}/records?type=${sport}`,
+        ];
+
+        const results = [];
+        for (const ep of endpoints) {
+          try {
+            const d = await callIntervals(ep);
+            if (d && (Array.isArray(d) ? d.length > 0 : Object.keys(d).length > 0)) {
+              results.push({ endpoint: ep, data: d });
+            }
+          } catch (_) {}
+        }
+
+        if (!results.length) {
+          return { content: [{ type: "text", text: "No performance curve data found. Endpoints probados: " + endpoints.join(", ") }] };
+        }
+
+        const lines = [`📈 DATOS DE RENDIMIENTO — ${sport}\n`];
+        results.forEach(({ endpoint, data }) => {
+          lines.push(`\n✅ ${endpoint}`);
+          const dump = JSON.stringify(data, null, 2).slice(0, 1500);
+          lines.push(dump);
+        });
+
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      } catch (err) {
+        return { content: [{ type: "text", text: `❌ get_performance_data: ${err.message}` }] };
+      }
+    }
+  );
+
   srv.tool("create_event",
     "Create a workout or event in the intervals.icu calendar",
     {
