@@ -78,7 +78,8 @@ function fmtDuration(secs) {
 const fmt1 = (v) => (v != null && !isNaN(v)) ? Number(v).toFixed(1) : "N/A";
 const fmt0 = (v) => (v != null && !isNaN(v)) ? Math.round(Number(v)).toString() : "N/A";
 
-// ─── MCP Server ───────────────────────────────────────────────────────────────
+// ─── MCP Server factory — new instance per SSE connection ────────────────────
+function createServer() {
 const server = new McpServer({ name: "intervals-mcp", version: "2.0.0" });
 
 // ── get_athlete_profile ───────────────────────────────────────────────────────
@@ -486,6 +487,9 @@ server.tool(
   }
 );
 
+  return server;
+} // end createServer()
+
 // ─── Express + SSE ────────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json());
@@ -496,6 +500,8 @@ app.get("/sse", async (req, res) => {
   const transport = new SSEServerTransport("/messages", res);
   transports[transport.sessionId] = transport;
   res.on("close", () => delete transports[transport.sessionId]);
+  // Create a fresh McpServer instance per connection to avoid "already connected" error
+  const server = createServer();
   await server.connect(transport);
 });
 
