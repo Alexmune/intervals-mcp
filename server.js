@@ -81,28 +81,98 @@ function createServer() {
   const srv = new McpServer({ name: "intervals-mcp", version: "4.0.0" });
 
   srv.tool("get_athlete_profile",
-    "Get athlete profile: name, weight, FTP, max HR, LTHR, running threshold pace, VO2max",
+    "Get full athlete profile: demographics, weight, HR zones, pace zones, FTP, VO2max, thresholds. Dumps all available fields.",
     {},
     async () => {
       try {
         const raw  = await callIntervals(`/athlete/${ATHLETE_ID}`);
-        const data = raw.athlete || raw;
+        const d    = raw.athlete || raw;
+
         const lines = [
-          `👤 ${data.name || data.username || "N/A"}`,
-          data.city       ? `📍 ${data.city}` : null,
-          data.sex        ? `⚧  ${data.sex}` : null,
-          data.dob        ? `🎂 ${data.dob}` : null,
-          data.weight     ? `⚖️  ${data.weight} kg` : null,
-          data.lthr       ? `❤️  LTHR: ${data.lthr} bpm` : null,
-          data.maxHR      ? `💓 Max HR: ${data.maxHR} bpm` : null,
-          data.restingHR  ? `🛌 Resting HR: ${data.restingHR} bpm` : null,
-          data.runningFTP ? `🏃 Running FTP: ${data.runningFTP}` : null,
-          data.vo2max     ? `🫁 VO2max: ${data.vo2max}` : null,
-        ].filter(Boolean);
-        if (lines.length <= 2) return { content: [{ type: "text", text: `Raw: ${JSON.stringify(data, null, 2)}` }] };
+          `👤 PERFIL — ${d.name || d.username || "N/A"}`,
+          d.city      ? `📍 ${d.city}` : null,
+          d.country   ? `🌍 ${d.country}` : null,
+          d.sex       ? `⚧  ${d.sex}` : null,
+          d.dob       ? `🎂 DOB: ${d.dob}` : null,
+          d.weight    ? `⚖️  Peso: ${d.weight} kg` : null,
+          d.height    ? `📐 Altura: ${d.height} cm` : null,
+          ``,
+          `❤️  UMBRALES`,
+          d.maxHR          ? `   FC máxima: ${d.maxHR} bpm` : null,
+          d.restingHR      ? `   FC reposo: ${d.restingHR} bpm` : null,
+          d.lthr           ? `   LTHR: ${d.lthr} bpm` : null,
+          d.ftp            ? `   FTP ciclismo: ${d.ftp} W` : null,
+          d.runningFTP     ? `   FTP running: ${d.runningFTP}` : null,
+          d.swimFTP        ? `   FTP natación: ${d.swimFTP}` : null,
+          d.vo2max         ? `   VO2max: ${d.vo2max}` : null,
+          d.lactateThreshold ? `   Lactato: ${d.lactateThreshold}` : null,
+        ].filter(v => v != null);
+
+        // HR zones
+        const hrZones = d.hrZones || d.heartRateZones || d.zones?.hr || [];
+        if (hrZones.length) {
+          lines.push(`\n📊 ZONAS FC`);
+          hrZones.forEach((z, i) => {
+            const from = z.min || z.from || z.low || "";
+            const to   = z.max || z.to   || z.high || "";
+            lines.push(`   Z${i+1}: ${from}–${to} bpm`);
+          });
+        }
+
+        // Pace zones
+        const paceZones = d.paceZones || d.zones?.pace || [];
+        if (paceZones.length) {
+          lines.push(`\n🏃 ZONAS RITMO`);
+          paceZones.forEach((z, i) => {
+            lines.push(`   Z${i+1}: ${z.min || z.from || ""} – ${z.max || z.to || ""} min/km`);
+          });
+        }
+
+        // Power zones
+        const pwrZones = d.powerZones || d.zones?.power || [];
+        if (pwrZones.length) {
+          lines.push(`\n⚡ ZONAS POTENCIA`);
+          pwrZones.forEach((z, i) => {
+            lines.push(`   Z${i+1}: ${z.min || z.from || ""}–${z.max || z.to || ""} W`);
+          });
+        }
+
+        // Dump any extra unknown keys for debugging
+        const knownKeys = new Set(["name","username","city","country","sex","dob","weight","height","maxHR","restingHR","lthr","ftp","runningFTP","swimFTP","vo2max","lactateThreshold","hrZones","heartRateZones","paceZones","powerZones","zones","athlete","id"]);
+        const extras = Object.entries(d).filter(([k,v]) => !knownKeys.has(k) && v != null && typeof v !== "object");
+        if (extras.length) {
+          lines.push(`\n📋 OTROS CAMPOS`);
+          extras.forEach(([k,v]) => lines.push(`   ${k}: ${v}`));
+        }
+
         return { content: [{ type: "text", text: lines.join("\n") }] };
       } catch (err) {
-        return { content: [{ type: "text", text: `❌ ${err.message}` }] };
+        return { content: [{ type: "text", text: `❌ get_athlete_profile: ${err.message}` }] };
+      }
+    }
+  );
+
+  srv.tool("get_athlete_settings",
+    "Get athlete sport settings: HR zones, pace zones, power zones, FTP, thresholds per sport type.",
+    {},
+    async () => {
+      try {
+        const data = await callIntervals(`/athlete/${ATHLETE_ID}/settings`);
+        if (!data || typeof data !== "object") {
+          return { content: [{ type: "text", text: "No settings data available." }] };
+        }
+        const lines = [`⚙️ CONFIGURACIÓN DEL ATLETA\n`];
+        // Dump all settings - structure varies per athlete
+        const dump = JSON.stringify(data, null, 2);
+        // If too long, truncate intelligently
+        if (dump.length > 3000) {
+          lines.push(dump.slice(0, 3000) + "\n... (truncado)");
+        } else {
+          lines.push(dump);
+        }
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      } catch (err) {
+        return { content: [{ type: "text", text: `❌ get_athlete_settings: ${err.message}` }] };
       }
     }
   );
@@ -366,7 +436,7 @@ function createServer() {
   );
 
   srv.tool("get_wellness",
-    "Get wellness: HRV, resting HR, sleep, weight, fatigue, mood, motivation, soreness",
+    "Get wellness data: HRV, resting HR, sleep, weight, steps, calories, stress, SpO2, Body Battery, fatigue, mood, motivation, soreness",
     {
       start_date: z.string().optional().describe("Start date YYYY-MM-DD (default: 14 days ago)"),
       end_date:   z.string().optional().describe("End date YYYY-MM-DD (default: today)"),
@@ -377,55 +447,75 @@ function createServer() {
         const params = new URLSearchParams({ oldest: range.oldest, newest: range.newest });
         const data   = await callIntervals(`/athlete/${ATHLETE_ID}/wellness?${params}`);
         const entries = toArray(data, "wellness").filter(w =>
-          w.hrv || w.restingHR || w.sleepSecs || w.weight ||
+          w.hrv || w.restingHR || w.sleepSecs || w.weight || w.steps ||
+          w.calories || w.bodyBattery || w.stress || w.spO2 || w.respiration ||
           w.fatigue != null || w.mood != null || w.motivation != null
         );
         if (!entries.length) return { content: [{ type: "text", text: "No wellness data in range." }] };
         const lines = entries.map(w => [
           `📅 ${w.id}`,
-          w.hrv        ? `   💓 HRV: ${w.hrv}` : null,
-          w.restingHR  ? `   ❤️  Resting HR: ${w.restingHR} bpm` : null,
-          w.sleepSecs  ? `   😴 Sleep: ${(w.sleepSecs/3600).toFixed(1)}h` : null,
-          w.sleepScore ? `   💤 Sleep score: ${w.sleepScore}/100` : null,
-          w.weight     ? `   ⚖️  ${w.weight} kg` : null,
-          w.fatigue    != null ? `   😩 Fatigue: ${w.fatigue}/10` : null,
-          w.mood       != null ? `   😊 Mood: ${w.mood}/10` : null,
-          w.motivation != null ? `   🔥 Motivation: ${w.motivation}/10` : null,
-          w.soreness   != null ? `   💪 Soreness: ${w.soreness}/10` : null,
-          w.notes      ? `   📝 ${w.notes}` : null,
+          w.hrv          ? `   💓 HRV: ${w.hrv}` : null,
+          w.restingHR    ? `   ❤️  FC reposo: ${w.restingHR} bpm` : null,
+          w.sleepSecs    ? `   😴 Sueño: ${(w.sleepSecs/3600).toFixed(1)}h` : null,
+          w.sleepScore   ? `   💤 Calidad sueño: ${w.sleepScore}/100` : null,
+          w.steps        ? `   👣 Pasos: ${w.steps.toLocaleString()}` : null,
+          w.calories     ? `   🔥 Calorías totales: ${w.calories} kcal` : null,
+          w.weight       ? `   ⚖️  Peso: ${w.weight} kg` : null,
+          w.bodyBattery  ? `   🔋 Body Battery: ${w.bodyBattery}` : null,
+          w.stress       ? `   😰 Estrés: ${w.stress}` : null,
+          w.spO2         ? `   🫁 SpO2: ${w.spO2}%` : null,
+          w.respiration  ? `   💨 Respiración: ${w.respiration} rpm` : null,
+          w.fatigue      != null ? `   😩 Fatiga: ${w.fatigue}/10` : null,
+          w.mood         != null ? `   😊 Estado de ánimo: ${w.mood}/10` : null,
+          w.motivation   != null ? `   🔥 Motivación: ${w.motivation}/10` : null,
+          w.soreness     != null ? `   💪 Agujetas: ${w.soreness}/10` : null,
+          w.notes        ? `   📝 ${w.notes}` : null,
         ].filter(Boolean).join("\n"));
         return { content: [{ type: "text", text: lines.join("\n\n") }] };
       } catch (err) {
-        return { content: [{ type: "text", text: `❌ ${err.message}` }] };
+        return { content: [{ type: "text", text: `❌ get_wellness: ${err.message}` }] };
       }
     }
   );
 
   srv.tool("get_fitness",
-    "Get CTL (fitness), ATL (fatigue), TSB (form) training load curves",
+    "Get CTL (fitness), ATL (fatigue), TSB (form) training load curves. TSB = CTL - ATL.",
     {
       start_date: z.string().optional().describe("Start date YYYY-MM-DD (default: 42 days ago)"),
       end_date:   z.string().optional().describe("End date YYYY-MM-DD (default: today)"),
     },
     async ({ start_date, end_date }) => {
       try {
-        const range  = safeRange(start_date || daysAgo(42), end_date, 60);
+        const range  = safeRange(start_date || daysAgo(42), end_date, 180);
         const params = new URLSearchParams({ oldest: range.oldest, newest: range.newest });
         const data   = await callIntervals(`/athlete/${ATHLETE_ID}/wellness?${params}`);
         const entries = toArray(data, "wellness");
-        const withLoad = entries.filter(d => d.ctl != null || d.atl != null || d.tsb != null);
+        const withLoad = entries.filter(d => d.ctl != null || d.atl != null);
         if (!withLoad.length) {
           const sample = entries[entries.length - 1] || {};
-          return { content: [{ type: "text", text: `⚠️ No CTL/ATL/TSB. Fields: ${Object.keys(sample).join(", ")}` }] };
+          return { content: [{ type: "text", text: `⚠️ No CTL/ATL data. Campos disponibles: ${Object.keys(sample).join(", ")}` }] };
         }
         const latest = withLoad[withLoad.length - 1];
-        const rows   = withLoad.slice(-10).map(d =>
-          `  ${d.id}  CTL ${fmt1(d.ctl).padStart(5)}  ATL ${fmt1(d.atl).padStart(5)}  TSB ${fmt1(d.tsb).padStart(6)}`
-        );
-        const header = `📊 TRAINING LOAD\nLatest (${latest.id}): CTL ${fmt1(latest.ctl)} | ATL ${fmt1(latest.atl)} | TSB ${fmt1(latest.tsb)}\n\nLast ${rows.length} days:\n`;
-        return { content: [{ type: "text", text: header + rows.join("\n") }] };
+        // TSB = CTL - ATL (calculate if not in API response)
+        const tsbLatest = latest.tsb != null ? latest.tsb : (latest.ctl != null && latest.atl != null ? latest.ctl - latest.atl : null);
+        const header = [
+          `📊 CARGA DE ENTRENAMIENTO`,
+          `Último dato (${latest.id}):`,
+          `   CTL (Forma crónica): ${fmt1(latest.ctl)}`,
+          `   ATL (Fatiga aguda):  ${fmt1(latest.atl)}`,
+          `   TSB (Frescura):      ${tsbLatest != null ? fmt1(tsbLatest) : "N/A"}`,
+          tsbLatest != null ? `   Estado: ${tsbLatest > 5 ? "🟢 Fresco" : tsbLatest > -10 ? "🟡 Óptimo" : tsbLatest > -25 ? "🟠 Cansado" : "🔴 Sobreentrenamiento"}` : null,
+          `\nÚltimos ${Math.min(withLoad.length, 14)} días:`,
+        ].filter(Boolean).join("\n");
+
+        const rows = withLoad.slice(-14).map(d => {
+          const tsb = d.tsb != null ? d.tsb : (d.ctl != null && d.atl != null ? d.ctl - d.atl : null);
+          return `  ${d.id}  CTL ${fmt1(d.ctl).padStart(5)}  ATL ${fmt1(d.atl).padStart(5)}  TSB ${tsb != null ? fmt1(tsb).padStart(6) : "   N/A"}`;
+        });
+
+        return { content: [{ type: "text", text: header + "\n" + rows.join("\n") }] };
       } catch (err) {
-        return { content: [{ type: "text", text: `❌ ${err.message}` }] };
+        return { content: [{ type: "text", text: `❌ get_fitness: ${err.message}` }] };
       }
     }
   );
@@ -488,14 +578,43 @@ function createServer() {
         const events = toArray(data, "events");
         if (!events.length) return { content: [{ type: "text", text: "No planned events." }] };
         const lines = events.map(e => [
-          `📅 ${(e.start_date_local || e.date || "").split("T")[0]} — ${e.name || "Event"} (${e.type || "Event"}) [ID:${e.id}]`,
+          `📅 ${(e.start_date_local || e.date || "").split("T")[0]} — ${e.name || "Event"} (${e.type || e.category || "Event"}) [ID:${e.id}]`,
           e.description ? `   📝 ${e.description}` : null,
-          e.load        ? `   📊 Load: ${e.load}` : null,
-          e.moving_time ? `   ⏱ ${fmtDuration(e.moving_time)}` : null,
+          e.load        ? `   📊 Carga objetivo: ${e.load}` : null,
+          e.moving_time ? `   ⏱ Duración: ${fmtDuration(e.moving_time)}` : null,
+          e.distance    ? `   📏 Distancia: ${(e.distance/1000).toFixed(1)} km` : null,
         ].filter(Boolean).join("\n"));
         return { content: [{ type: "text", text: lines.join("\n\n") }] };
       } catch (err) {
-        return { content: [{ type: "text", text: `❌ ${err.message}` }] };
+        return { content: [{ type: "text", text: `❌ get_events: ${err.message}` }] };
+      }
+    }
+  );
+
+  srv.tool("get_event_by_id",
+    "Get full details of a specific calendar event or planned workout by its ID.",
+    { event_id: z.string().describe("Event ID (shown as [ID:xxx] in get_events)") },
+    async ({ event_id }) => {
+      try {
+        const data = await callIntervals(`/athlete/${ATHLETE_ID}/events/${event_id}`);
+        if (!data || typeof data !== "object") {
+          return { content: [{ type: "text", text: `No event found with ID ${event_id}` }] };
+        }
+        const e = Array.isArray(data) ? data[0] : data;
+        const lines = [
+          `📅 EVENTO: ${(e.start_date_local || e.date || "").split("T")[0]} — ${e.name || "Event"}`,
+          e.type || e.category ? `   Tipo: ${e.type || e.category}` : null,
+          e.description        ? `   📝 ${e.description}` : null,
+          e.load               ? `   📊 Carga objetivo: ${e.load}` : null,
+          e.moving_time        ? `   ⏱ Duración: ${fmtDuration(e.moving_time)}` : null,
+          e.distance           ? `   📏 Distancia: ${(e.distance/1000).toFixed(1)} km` : null,
+          e.pace_target        ? `   🏃 Ritmo objetivo: ${e.pace_target}` : null,
+          e.hr_target          ? `   ❤️  FC objetivo: ${e.hr_target}` : null,
+          e.id                 ? `   🆔 ID: ${e.id}` : null,
+        ].filter(Boolean);
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      } catch (err) {
+        return { content: [{ type: "text", text: `❌ get_event_by_id: ${err.message}` }] };
       }
     }
   );
