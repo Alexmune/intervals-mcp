@@ -144,9 +144,14 @@ function createServer() {
     { activity_id: z.string().describe("Activity ID e.g. i139521833") },
     async ({ activity_id }) => {
       try {
-        const cleanId = activity_id.replace(/^i/, "");
-        // Correct endpoint: /api/v1/activity/{id} (no athlete prefix)
-        const a = await callIntervals(`/activity/${cleanId}`);
+        // Try with full ID (including i prefix) first, then without
+        let a;
+        try {
+          a = await callIntervals(`/activity/${activity_id}`);
+        } catch (e1) {
+          const cleanId = activity_id.replace(/^i/, "");
+          a = await callIntervals(`/activity/${cleanId}`);
+        }
 
         if (!a || typeof a !== "object" || Array.isArray(a)) {
           return { content: [{ type: "text", text: `⚠️ Unexpected response: ${JSON.stringify(a).slice(0,200)}` }] };
@@ -209,8 +214,14 @@ function createServer() {
     { activity_id: z.string().describe("Activity ID e.g. i139521833") },
     async ({ activity_id }) => {
       try {
-        const cleanId = activity_id.replace(/^i/, "");
-        const data = await callIntervals(`/activity/${cleanId}/streams`);
+        // Try with full ID first, then without i prefix
+        let data;
+        try {
+          data = await callIntervals(`/activity/${activity_id}/streams`);
+        } catch (e1) {
+          const cleanId = activity_id.replace(/^i/, "");
+          data = await callIntervals(`/activity/${cleanId}/streams`);
+        }
 
         if (!data || typeof data !== "object") {
           return { content: [{ type: "text", text: "No stream data available." }] };
@@ -282,7 +293,7 @@ function createServer() {
     },
     async ({ start_date, end_date }) => {
       try {
-        const range  = safeRange(start_date || daysAgo(14), end_date, 60);
+        const range  = safeRange(start_date || daysAgo(14), end_date, 180);
         const params = new URLSearchParams({ oldest: range.oldest, newest: range.newest });
         const data   = await callIntervals(`/athlete/${ATHLETE_ID}/wellness?${params}`);
         const entries = toArray(data, "wellness").filter(w =>
