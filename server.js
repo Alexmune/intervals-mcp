@@ -75,11 +75,13 @@ function fmtDuration(secs) {
 const fmt1 = (v) => (v != null && !isNaN(v)) ? Number(v).toFixed(1) : "N/A";
 const fmt0 = (v) => (v != null && !isNaN(v)) ? Math.round(Number(v)).toString() : "N/A";
 
-// ─── MCP Server (singleton — same pattern as original working v1) ─────────────
-const server = new McpServer({ name: "intervals-mcp", version: "3.0.0" });
+// ─── MCP Server factory — one fresh instance per SSE connection ──────────────
+// Required by SDK: "use a separate Protocol instance per connection"
+function createServer() {
+  const srv = new McpServer({ name: "intervals-mcp", version: "3.0.0" });
 
 // ── get_athlete_profile ───────────────────────────────────────────────────────
-server.tool("get_athlete_profile",
+  srv.tool("get_athlete_profile",
   "Get athlete profile: name, weight, FTP, max HR, LTHR, running threshold pace, VO2max",
   {},
   async () => {
@@ -109,7 +111,7 @@ server.tool("get_athlete_profile",
 );
 
 // ── get_activities ────────────────────────────────────────────────────────────
-server.tool("get_activities",
+  srv.tool("get_activities",
   "Get recent activities: distance, pace, HR, power, TSS, calories. Returns IDs for get_activity_detail.",
   {
     oldest: z.string().optional().describe("Start date YYYY-MM-DD (default: 30 days ago)"),
@@ -142,7 +144,7 @@ server.tool("get_activities",
 );
 
 // ── get_activity_detail ───────────────────────────────────────────────────────
-server.tool("get_activity_detail",
+  srv.tool("get_activity_detail",
   "Deep detail for one activity: splits, HR zones, pace zones. Use ID from get_activities [ID:xxx].",
   { activity_id: z.string().describe("Activity ID") },
   async ({ activity_id }) => {
@@ -175,7 +177,7 @@ server.tool("get_activity_detail",
 );
 
 // ── get_wellness ──────────────────────────────────────────────────────────────
-server.tool("get_wellness",
+  srv.tool("get_wellness",
   "Get wellness: HRV, resting HR, sleep, weight, fatigue, mood, motivation, soreness",
   {
     start_date: z.string().optional().describe("Start date YYYY-MM-DD (default: 14 days ago)"),
@@ -212,7 +214,7 @@ server.tool("get_wellness",
 );
 
 // ── get_fitness ───────────────────────────────────────────────────────────────
-server.tool("get_fitness",
+  srv.tool("get_fitness",
   "Get CTL (fitness), ATL (fatigue), TSB (form) training load curves",
   {
     start_date: z.string().optional().describe("Start date YYYY-MM-DD (default: 42 days ago)"),
@@ -242,7 +244,7 @@ server.tool("get_fitness",
 );
 
 // ── get_weekly_stats ──────────────────────────────────────────────────────────
-server.tool("get_weekly_stats",
+  srv.tool("get_weekly_stats",
   "Weekly training totals: km, duration, sessions, TSS, calories per week.",
   { weeks: z.number().optional().describe("Weeks to look back (default: 8, max: 12)") },
   async ({ weeks = 8 }) => {
@@ -288,7 +290,7 @@ server.tool("get_weekly_stats",
 );
 
 // ── get_events ────────────────────────────────────────────────────────────────
-server.tool("get_events",
+  srv.tool("get_events",
   "Get planned workouts and events from the intervals.icu calendar",
   {
     start_date: z.string().optional().describe("Start date YYYY-MM-DD (default: today)"),
@@ -314,7 +316,7 @@ server.tool("get_events",
 );
 
 // ── create_event ──────────────────────────────────────────────────────────────
-server.tool("create_event",
+  srv.tool("create_event",
   "Create a workout or event in the intervals.icu calendar",
   {
     date:          z.string().describe("Date YYYY-MM-DD"),
@@ -342,7 +344,7 @@ server.tool("create_event",
 );
 
 // ── update_wellness ───────────────────────────────────────────────────────────
-server.tool("update_wellness",
+  srv.tool("update_wellness",
   "Update wellness for a day: HRV, resting HR, sleep, weight, fatigue, mood, motivation, soreness, notes",
   {
     date:        z.string().describe("Date YYYY-MM-DD"),
@@ -381,7 +383,7 @@ server.tool("update_wellness",
 );
 
 // ── delete_event ──────────────────────────────────────────────────────────────
-server.tool("delete_event",
+  srv.tool("delete_event",
   "Delete a planned event by its ID (from get_events [ID:xxx])",
   { event_id: z.string().describe("Event ID") },
   async ({ event_id }) => {
@@ -394,7 +396,10 @@ server.tool("delete_event",
   }
 );
 
-// ─── Express + SSE (same architecture as original working v1) ─────────────────
+  return srv;
+} // ── end createServer() ────────────────────────────────────────────────────────
+
+// ─── Express + SSE ────────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json());
 
@@ -407,13 +412,28 @@ app.use((req, res, next) => {
   next();
 });
 
+// Disable Railway/nginx proxy buffering — critical for SSE to work
+// Without this header, nginx buffers the stream and Claude.ai times out
+app.use("/sse", (req, res, next) => {
+  res.setHeader("X-Accel-Buffering", "no");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  next();
+});
+
 const transports = {};
 
 app.get("/sse", async (req, res) => {
-  const transport = new SSEServerTransport("/messages", res);
-  transports[transport.sessionId] = transport;
-  res.on("close", () => delete transports[transport.sessionId]);
-  await server.connect(transport);
+  try {
+    const transport = new SSEServerTransport("/messages", res);
+    transports[transport.sessionId] = transport;
+    res.on("close", () => delete transports[transport.sessionId]);
+    const mcpServer = createServer();
+    await mcpServer.connect(transport);
+  } catch (err) {
+    console.error("SSE error:", err.message);
+    if (!res.headersSent) res.status(500).end();
+  }
 });
 
 app.post("/messages", async (req, res) => {
