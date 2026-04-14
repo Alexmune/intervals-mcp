@@ -1,14 +1,14 @@
 {
   "name": "intervals-mcp-server",
   "version": "1.0.0",
-  "description": "MCP Server for intervals.icu - Personal trainer integration for Claude",
+  "description": "MCP Server for intervals.icu",
   "type": "module",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@modelcontextprotocol/sdk": "1.0.4",
     "express": "^4.18.2",
     "zod": "^3.22.4"
   },
