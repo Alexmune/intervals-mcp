@@ -198,40 +198,169 @@ function createServer() {
   );
 
   srv.tool("get_activity_streams",
-    "Get per-second stream data for an activity: pace, HR, cadence, altitude. Calculates time in each HR zone.",
+    "Get per-second stream data: HR, cadence, pace, altitude, power. Calculates time in HR zones.",
+    {
+      activity_id:  z.string().describe("Activity ID e.g. i139521833"),
+      stream_types: z.string().optional().describe("Comma-separated stream types (default: time,heartrate,cadence,velocity_smooth,altitude,distance)"),
+    },
+    async ({ activity_id, stream_types }) => {
+      try {
+        const cleanId = activity_id.replace(/^i/, "");
+        const types   = stream_types || "time,heartrate,cadence,velocity_smooth,altitude,distance,watts";
+        const params  = new URLSearchParams({ types });
+
+        let raw;
+        try { raw = await callIntervals(`/activity/${activity_id}/streams?${params}`); }
+        catch (_) { raw = await callIntervals(`/activity/${cleanId}/streams?${params}`); }
+
+        // API returns a LIST of stream objects: [{type, name, data, valueType}, ...]
+        const streams = Array.isArray(raw) ? raw : (raw ? [raw] : []);
+        if (!streams.length) return { content: [{ type: "text", text: "No hay streams para esta actividad." }] };
+
+        // Index streams by type
+        const byType = {};
+        streams.forEach(s => { if (s.type) byType[s.type] = s.data || []; });
+
+        const availableTypes = streams.map(s => s.type || s.name).join(", ");
+        const lines = [`📈 Streams disponibles: ${availableTypes}\n`];
+
+        const time = byType.time || [];
+        const hr   = byType.heartrate || byType.heart_rate || [];
+        const vel  = byType.velocity_smooth || byType.speed || byType.velocity || [];
+        const cad  = byType.cadence || [];
+        const alt  = byType.altitude || [];
+        const pwr  = byType.watts || byType.power || [];
+
+        if (time.length) lines.push(`⏱ ${time.length} puntos · duración ${fmtDuration(time[time.length-1]||0)}`);
+
+        if (hr.length) {
+          const v = hr.filter(x => x > 0);
+          if (v.length) {
+            const avg = Math.round(v.reduce((a,b)=>a+b,0)/v.length);
+            const max = Math.max(...v), min = Math.min(...v);
+            lines.push(`\n❤️  FRECUENCIA CARDÍACA`);
+            lines.push(`   Media: ${avg} bpm | Máx: ${max} bpm | Mín: ${min} bpm`);
+            // Zonas de Alex: Z1 ≤133, Z2 134-148, Z3 149-163, Z4 164-178, Z5 >178
+            const z = [0,0,0,0,0];
+            v.forEach(x => {
+              if      (x <= 133) z[0]++;
+              else if (x <= 148) z[1]++;
+              else if (x <= 163) z[2]++;
+              else if (x <= 178) z[3]++;
+              else               z[4]++;
+            });
+            const tot = v.length;
+            const zn  = ["Z1 (≤133)","Z2 (134-148)","Z3 (149-163)","Z4 (164-178)","Z5 (>178)"];
+            z.forEach((c, i) => {
+              const pct  = Math.round(c/tot*100);
+              const mins = Math.round(c/60);
+              if (pct > 0) lines.push(`   ${zn[i]}: ${pct}% (~${mins} min)`);
+            });
+          }
+        }
+
+        if (vel.length) {
+          const v = vel.filter(x => x > 0);
+          if (v.length) {
+            const avg = v.reduce((a,b)=>a+b,0)/v.length;
+            const maxPace = fmtPace(Math.min(...v));
+            lines.push(`\n🏃 RITMO`);
+            lines.push(`   Medio: ${fmtPace(avg)}`);
+            if (maxPace) lines.push(`   Mejor km: ${maxPace}`);
+          }
+        }
+
+        if (cad.length) {
+          const v = cad.filter(x => x > 0);
+          if (v.length) {
+            const avg = Math.round(v.reduce((a,b)=>a+b,0)/v.length);
+            const max = Math.max(...v);
+            lines.push(`\n👟 CADENCIA`);
+            lines.push(`   Media: ${avg} spm | Máx: ${max} spm`);
+          }
+        }
+
+        if (alt.length) {
+          const max = Math.round(Math.max(...alt));
+          const min = Math.round(Math.min(...alt));
+          lines.push(`\n⛰️  ALTITUD: máx ${max} m | mín ${min} m | desnivel acum: ${max - min} m`);
+        }
+
+        if (pwr.length) {
+          const v = pwr.filter(x => x > 0);
+          if (v.length) {
+            const avg = Math.round(v.reduce((a,b)=>a+b,0)/v.length);
+            lines.push(`\n⚡ POTENCIA: media ${avg} W | máx ${Math.max(...v)} W`);
+          }
+        }
+
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      } catch (err) {
+        return { content: [{ type: "text", text: `❌ get_activity_streams: ${err.message}` }] };
+      }
+    }
+  );
+
+  srv.tool("get_activity_intervals",
+    "Get detailed interval/lap data for an activity: pace, HR, power, cadence per interval. Best tool for analyzing series and structured workouts.",
     { activity_id: z.string().describe("Activity ID e.g. i139521833") },
     async ({ activity_id }) => {
       try {
         const cleanId = activity_id.replace(/^i/, "");
-        let data;
-        try { data = await callIntervals(`/activity/${activity_id}/streams`); }
-        catch (_) { data = await callIntervals(`/activity/${cleanId}/streams`); }
-        if (!data || typeof data !== "object" || !Object.keys(data).length) {
-          return { content: [{ type: "text", text: "No hay datos de streams para esta actividad." }] };
+        let raw;
+        try { raw = await callIntervals(`/activity/${activity_id}/intervals`); }
+        catch (_) { raw = await callIntervals(`/activity/${cleanId}/intervals`); }
+
+        if (!raw || typeof raw !== "object") {
+          return { content: [{ type: "text", text: "No hay datos de intervalos para esta actividad." }] };
         }
-        const lines = [`📈 Streams: ${Object.keys(data).join(", ")}\n`];
-        const time = Array.isArray(data.time) ? data.time : [];
-        const hr   = Array.isArray(data.heartrate) ? data.heartrate : Array.isArray(data.heart_rate) ? data.heart_rate : [];
-        const vel  = Array.isArray(data.velocity_smooth) ? data.velocity_smooth : Array.isArray(data.speed) ? data.speed : Array.isArray(data.velocity) ? data.velocity : [];
-        const cad  = Array.isArray(data.cadence) ? data.cadence : [];
-        const alt  = Array.isArray(data.altitude) ? data.altitude : [];
-        if (time.length) lines.push(`⏱ ${time.length} puntos · ${fmtDuration(time[time.length-1]||0)}`);
-        if (hr.length) {
-          const v = hr.filter(x=>x>0);
-          if (v.length) {
-            const avg = Math.round(v.reduce((a,b)=>a+b,0)/v.length);
-            lines.push(`\n❤️  FC: media ${avg} | máx ${Math.max(...v)} | mín ${Math.min(...v)} bpm`);
-            const z=[0,0,0,0,0]; v.forEach(x=>{if(x<=133)z[0]++;else if(x<=148)z[1]++;else if(x<=163)z[2]++;else if(x<=178)z[3]++;else z[4]++;});
-            const tot=v.length, zn=["Z1 (≤133)","Z2 (134-148)","Z3 (149-163)","Z4 (164-178)","Z5 (>178)"];
-            z.forEach((c,i)=>{const p=Math.round(c/tot*100),m=Math.round(c/60);if(p>0)lines.push(`   ${zn[i]}: ${p}% (~${m}min)`);});
-          }
+
+        const intervals = raw.icu_intervals || [];
+        const groups    = raw.icu_groups    || [];
+
+        if (!intervals.length && !groups.length) {
+          return { content: [{ type: "text", text: `No se encontraron intervalos. Campos disponibles: ${Object.keys(raw).join(", ")}` }] };
         }
-        if (vel.length) { const v=vel.filter(x=>x>0); if(v.length) lines.push(`\n🏃 Ritmo: ${fmtPace(v.reduce((a,b)=>a+b,0)/v.length)}`); }
-        if (cad.length) { const v=cad.filter(x=>x>0); if(v.length) lines.push(`\n👟 Cadencia: ${Math.round(v.reduce((a,b)=>a+b,0)/v.length)} spm`); }
-        if (alt.length) lines.push(`\n⛰️  Altitud: máx ${Math.round(Math.max(...alt))} m | mín ${Math.round(Math.min(...alt))} m`);
+
+        const lines = [`🔁 INTERVALOS (${intervals.length} total)\n`];
+
+        intervals.forEach((iv, i) => {
+          const label    = iv.label || iv.name || `Intervalo ${i+1}`;
+          const dist     = iv.distance ? `${(iv.distance/1000).toFixed(2)} km` : null;
+          const dur      = iv.moving_time || iv.elapsed_time || iv.timer_time;
+          const pace     = iv.average_speed || iv.avg_speed;
+          const hr       = iv.average_heartrate || iv.avg_hr;
+          const maxHr    = iv.max_heartrate || iv.max_hr;
+          const watts    = iv.average_watts || iv.avg_watts;
+          const cadence  = iv.average_cadence || iv.avg_cadence;
+          const type     = iv.type || "";
+
+          const parts = [
+            `${i+1}. ${label}${type ? ` [${type}]` : ""}`,
+            dist ? `   📏 ${dist}` : null,
+            dur  ? `   ⏱ ${fmtDuration(dur)}` : null,
+            pace ? `   🏃 ${fmtPace(pace)}` : null,
+            hr   ? `   ❤️  FC media: ${fmt0(hr)} bpm${maxHr ? ` | máx: ${fmt0(maxHr)} bpm` : ""}` : null,
+            watts   ? `   ⚡ ${fmt0(watts)} W` : null,
+            cadence ? `   👟 ${fmt0(cadence)} spm` : null,
+          ].filter(Boolean);
+
+          lines.push(parts.join("\n"));
+        });
+
+        // Groups (series agrupadas)
+        if (groups.length) {
+          lines.push(`\n📊 GRUPOS/SERIES (${groups.length})`);
+          groups.forEach((g, i) => {
+            const count = g.count || g.reps || "";
+            const name  = g.name || g.label || `Grupo ${i+1}`;
+            lines.push(`  ${i+1}. ${name}${count ? ` × ${count}` : ""}`);
+          });
+        }
+
         return { content: [{ type: "text", text: lines.join("\n") }] };
       } catch (err) {
-        return { content: [{ type: "text", text: `❌ get_activity_streams: ${err.message}` }] };
+        return { content: [{ type: "text", text: `❌ get_activity_intervals: ${err.message}` }] };
       }
     }
   );
