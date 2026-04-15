@@ -375,10 +375,10 @@ function createServer() {
           const v = vel.filter(x => x > 0);
           if (v.length) {
             const avg = v.reduce((a,b)=>a+b,0)/v.length;
-            const maxPace = fmtPace(Math.min(...v));
+            const best = fmtPace(Math.max(...v)); // highest m/s = fastest pace
             lines.push(`\n🏃 RITMO`);
             lines.push(`   Medio: ${fmtPace(avg)}`);
-            if (maxPace) lines.push(`   Mejor km: ${maxPace}`);
+            if (best) lines.push(`   Mejor momento: ${best}`);
           }
         }
 
@@ -930,8 +930,11 @@ function createServer() {
     },
     async ({ date, name, type = "Run", description, load, duration_mins, steps }) => {
       try {
+        // Set correct start time: Saturday = 09:00, weekdays = 19:00
+        const dayOfWeek = new Date(date).getDay(); // 0=Sun, 6=Sat
+        const startTime = dayOfWeek === 6 ? "09:00:00" : "19:00:00";
         const body = {
-          start_date_local: `${date}T17:00:00`,
+          start_date_local: `${date}T${startTime}`,
           name, type,
           category: "WORKOUT",
           description: description || "",
@@ -983,7 +986,36 @@ function createServer() {
     }
   );
 
-  srv.tool("update_wellness",
+  srv.tool("update_event",
+    "Update an existing calendar event: change name, description, date, duration or load.",
+    {
+      event_id:      z.string().describe("Event ID to update (from get_events [ID:xxx])"),
+      name:          z.string().optional().describe("New workout name"),
+      description:   z.string().optional().describe("New description (use intervals.icu workout format with - steps)"),
+      date:          z.string().optional().describe("New date YYYY-MM-DD"),
+      load:          z.number().optional().describe("New target TSS/load"),
+      duration_mins: z.number().optional().describe("New planned duration in minutes"),
+    },
+    async ({ event_id, name, description, date, load, duration_mins }) => {
+      try {
+        const body = {
+          ...(name          && { name }),
+          ...(description   != null && { description }),
+          ...(load          && { load }),
+          ...(duration_mins && { moving_time: duration_mins * 60 }),
+        };
+        if (date) {
+          const dayOfWeek = new Date(date).getDay();
+          const startTime = dayOfWeek === 6 ? "09:00:00" : "19:00:00";
+          body.start_date_local = `${date}T${startTime}`;
+        }
+        await callIntervals(`/athlete/${ATHLETE_ID}/events/${event_id}`, "PUT", body);
+        return { content: [{ type: "text", text: `✅ Evento ${event_id} actualizado correctamente.` }] };
+      } catch (err) {
+        return { content: [{ type: "text", text: `❌ update_event: ${err.message}` }] };
+      }
+    }
+  );
     "Update wellness for a day: HRV, resting HR, sleep, weight, fatigue, mood, motivation, soreness, notes",
     {
       date:        z.string().describe("Date YYYY-MM-DD"),
