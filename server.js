@@ -842,13 +842,17 @@ function createServer() {
           { name: "Z5c (Sprint)",     pctMin: 112.5, pctMax: 999   },
         ];
 
-        // Parse CS to seconds/km
+        // Parse CS — intervals stores threshold_pace as m/s (e.g. 4.0650406 = 4:06/km)
         const parseCS = (cs) => {
           if (!cs) return null;
-          const parts = String(cs).split(":").map(Number);
-          if (parts.length === 2) return parts[0] * 60 + parts[1];
-          if (parts.length === 1) return parts[0];
-          return null;
+          const val = parseFloat(String(cs));
+          if (isNaN(val)) return null;
+          // If value > 20, assume it's already in seconds/km — unlikely for running
+          // If value < 20, it's m/s → convert to seconds/km
+          if (val > 0 && val < 20) {
+            return 1000 / val; // seconds per km
+          }
+          return val; // already in seconds/km
         };
 
         const secPerKm = (secs) => {
