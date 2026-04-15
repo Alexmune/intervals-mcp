@@ -883,14 +883,22 @@ function createServer() {
         }
         lines.push("");
 
-        // HR zones from running config (or cycling as fallback)
-        const hrz = runCfg?.hr_zones || configs[0]?.hr_zones || [];
-        const hzn = runCfg?.hr_zone_names || configs[0]?.hr_zone_names || [];
-        if (hrz.length) {
-          lines.push(`❤️  ZONAS FC`);
+        // Running HR zones — calculated from LTHR (same model as intervals.icu UI)
+        // Confirmed from user's settings: Z1 0-133, Z2 134-148, Z3 149-163, Z4 164-178, Z5 179+
+        const HR_ZONES = [
+          { name: "Z1 Recovery",    pctMax: 0.76  },
+          { name: "Z2 Endurance",   pctMax: 0.85  },
+          { name: "Z3 Tempo",       pctMax: 0.93  },
+          { name: "Z4 Threshold",   pctMax: 1.02  },
+          { name: "Z5 Interval",    pctMax: 99    },
+        ];
+        const lthrVal = lthr || runCfg?.lthr || configs[0]?.lthr;
+        if (lthrVal) {
+          lines.push(`\n❤️  ZONAS FC (calculadas desde LTHR = ${lthrVal} bpm)`);
           let prev = 0;
-          hrz.forEach((upper, i) => {
-            lines.push(`   ${hzn[i]||`Z${i+1}`}: ${prev+1}–${upper} bpm`);
+          HR_ZONES.forEach(z => {
+            const upper = z.pctMax >= 99 ? maxHR || 193 : Math.round(lthrVal * z.pctMax);
+            lines.push(`   ${z.name}: ${prev === 0 ? 0 : prev + 1}–${upper} bpm`);
             prev = upper;
           });
         }
