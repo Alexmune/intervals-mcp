@@ -703,41 +703,10 @@ function createServer() {
   );
 
   srv.tool("get_records",
-    "Get athlete personal records and best efforts (fastest times, longest distances, etc.)",
+    "Get athlete personal records. Note: not available on FREE plan of intervals.icu.",
     {},
     async () => {
-      try {
-        const data = await callIntervals(`/athlete/${ATHLETE_ID}/records`);
-        if (!data || typeof data !== "object") {
-          return { content: [{ type: "text", text: "No records data." }] };
-        }
-        const lines = [`🏆 RÉCORDS PERSONALES\n`];
-        // Records can be nested by sport or flat
-        const processRecords = (obj, prefix = "") => {
-          if (Array.isArray(obj)) {
-            obj.forEach(r => {
-              const name = r.name || r.distance || r.label || "";
-              const val  = r.value || r.time || r.pace || "";
-              const date = r.date || r.activity_date || "";
-              if (name && val) lines.push(`  ${prefix}${name}: ${val}${date ? ` (${date})` : ""}`);
-            });
-          } else if (typeof obj === "object") {
-            Object.entries(obj).forEach(([k, v]) => {
-              if (typeof v === "object" && v !== null) {
-                lines.push(`\n  📌 ${k}:`);
-                processRecords(v, "    ");
-              } else if (v != null) {
-                lines.push(`  ${prefix}${k}: ${v}`);
-              }
-            });
-          }
-        };
-        processRecords(data);
-        if (lines.length <= 2) lines.push("No personal records found.");
-        return { content: [{ type: "text", text: lines.join("\n") }] };
-      } catch (err) {
-        return { content: [{ type: "text", text: `❌ get_records: ${err.message}` }] };
-      }
+      return { content: [{ type: "text", text: "⚠️ El endpoint de récords no está disponible en el plan FREE de intervals.icu." }] };
     }
   );
 
@@ -911,69 +880,35 @@ function createServer() {
   );
 
   srv.tool("get_performance_data",
-    "Get performance curves: Critical Speed, D prime, best efforts at different distances, pace curve data.",
+    "Get performance data: Critical Speed (CS), D prime, pace zones from running settings.",
     { sport: z.string().optional().describe("Sport: Run, Ride (default: Run)") },
     async ({ sport = "Run" }) => {
       try {
+        const data    = await callIntervals(`/athlete/${ATHLETE_ID}/sport-settings`);
+        const configs = Array.isArray(data) ? data : [data];
+        const RUN_TYPES = ["run","walk","hike","trail","track","treadmill","virtualrun"];
+        const runCfg  = configs.find(c => (c.types||[]).some(t => RUN_TYPES.some(r => t.toLowerCase().includes(r))));
+        const cfg     = runCfg || configs[0];
+
+        const cs    = cfg?.threshold_pace;
+        const wPrime= cfg?.w_prime;
+        const lthr  = cfg?.lthr;
+
         const lines = [`📈 DATOS DE RENDIMIENTO — ${sport}\n`];
 
-        // 1. Try pace/power curve — correct intervals endpoint
-        const curveEndpoints = [
-          `/athlete/${ATHLETE_ID}/power-curves?type=${sport}&curves=mmp`,
-          `/athlete/${ATHLETE_ID}/power-curves?type=${sport}`,
-          `/athlete/${ATHLETE_ID}/pace-zones?type=${sport}`,
-        ];
-
-        for (const ep of curveEndpoints) {
-          try {
-            const d = await callIntervals(ep);
-            if (d && (Array.isArray(d) ? d.length > 0 : Object.keys(d).length > 0)) {
-              lines.push(`✅ ${ep}`);
-              lines.push(JSON.stringify(d, null, 2).slice(0, 1000));
-              lines.push("");
-            }
-          } catch (e) {
-            lines.push(`❌ ${ep}: ${e.message.slice(0, 80)}`);
-          }
+        if (cs) {
+          const csSecs = 1000 / (parseFloat(cs) * 60);
+          const mins   = Math.floor(csSecs / 60);
+          const secs   = Math.round(csSecs % 60);
+          lines.push(`🎯 Velocidad Crítica (CS): ${mins}:${String(secs).padStart(2,"0")} min/km`);
+          lines.push(`   (valor API: ${cs} m/s)`);
+        } else {
+          lines.push(`🎯 CS: no configurado en la API`);
         }
-
-        // 2. Try getting best efforts from activities with pace fields
-        const params = new URLSearchParams({
-          oldest: daysAgo(90),
-          newest: today(),
-          fields: "id,name,type,start_date_local,distance,average_speed,icu_best_efforts,icu_wo_defs"
-        });
-        try {
-          const actData = await callIntervals(`/athlete/${ATHLETE_ID}/activities?${params}`);
-          const acts = toArray(actData, "activities").filter(a =>
-            (a.type || "").toLowerCase().includes("run") &&
-            (a.icu_best_efforts || a.icu_wo_defs)
-          );
-          if (acts.length) {
-            lines.push(`\n🏆 MEJORES ESFUERZOS (${acts.length} actividades con datos)`);
-            acts.slice(0, 3).forEach(a => {
-              lines.push(`  ${(a.start_date_local||"").split("T")[0]} — ${a.name}`);
-              if (a.icu_best_efforts) lines.push(`    best_efforts: ${JSON.stringify(a.icu_best_efforts).slice(0,200)}`);
-            });
-          }
-        } catch (_) {}
-
-        // 3. Get CS/D' from sport settings
-        try {
-          const ss = await callIntervals(`/athlete/${ATHLETE_ID}/sport-settings`);
-          const configs = Array.isArray(ss) ? ss : [ss];
-          const runConfig = configs.find(c => (c.types||[]).some(t => t.toLowerCase().includes("run")));
-          if (runConfig?.threshold_pace || runConfig?.w_prime) {
-            lines.push(`\n🎯 VELOCIDAD CRÍTICA (sport-settings)`);
-            if (runConfig.threshold_pace) lines.push(`   CS (ritmo umbral): ${runConfig.threshold_pace}`);
-            if (runConfig.w_prime)        lines.push(`   D' (W'): ${runConfig.w_prime}`);
-          } else {
-            lines.push(`\nℹ️  CS/D' no configurados en sport-settings de running.`);
-            lines.push(`   Los valores que ves en intervals (CS 4:06, D' 116.4m) son calculados`);
-            lines.push(`   automáticamente por intervals a partir de tus mejores esfuerzos`);
-            lines.push(`   pero no se exponen directamente en la API pública.`);
-          }
-        } catch (_) {}
+        if (wPrime) lines.push(`🔋 D' (W'): ${wPrime} m`);
+        if (lthr)   lines.push(`❤️  LTHR: ${lthr} bpm`);
+        lines.push(`\nℹ️  La curva de pace completa (MMP) está disponible en intervals.icu → Rendimiento → Curvas.`);
+        lines.push(`   Los endpoints de curvas de rendimiento no están disponibles en la API pública.`);
 
         return { content: [{ type: "text", text: lines.join("\n") }] };
       } catch (err) {
