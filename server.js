@@ -932,6 +932,7 @@ function createServer() {
         const body = {
           start_date_local: `${date}T08:00:00`,
           name, type,
+          category: "WORKOUT",
           description: description || "",
           ...(load          && { load }),
           ...(duration_mins && { moving_time: duration_mins * 60 }),
