@@ -795,45 +795,101 @@ function createServer() {
   );
 
   srv.tool("get_sport_settings",
-    "Get sport-specific settings: HR zones, pace zones, Critical Speed (CS), D prime, thresholds for running, cycling, swimming.",
-    { sport: z.string().optional().describe("Sport type: Run, Ride, Swim (default: Run)") },
-    async ({ sport = "Run" }) => {
+    "Get running sport settings: HR zones, pace zones, Critical Speed (CS), D prime, threshold pace.",
+    {},
+    async () => {
       try {
-        const data = await callIntervals(`/athlete/${ATHLETE_ID}/sport-settings`);
+        const data    = await callIntervals(`/athlete/${ATHLETE_ID}/sport-settings`);
         const configs = Array.isArray(data) ? data : [data];
 
-        const lines = [`⚙️ CONFIGURACIÓN POR DEPORTE\n`];
+        // Find running config
+        const RUN_TYPES = ["run","walk","hike","trail","track","treadmill","virtualrun"];
+        const runCfg = configs.find(c =>
+          (c.types || []).some(t => RUN_TYPES.some(r => t.toLowerCase().includes(r)))
+        );
 
-        configs.forEach((cfg, idx) => {
-          const sports = cfg.types || [];
-          const isRunning = sports.some(t => t.toLowerCase().includes("run"));
-          const isCycling = sports.some(t => t.toLowerCase().includes("ride"));
-          const sportName = isRunning ? "🏃 RUNNING" : isCycling ? "🚴 CICLISMO" : `DEPORTE ${idx+1}`;
+        const lines = [`⚙️ CONFIGURACIÓN RUNNING\n`];
 
-          lines.push(`${sportName} (${sports.join(", ")})`);
+        // If no running config, show what exists and calculate from known CS
+        if (!runCfg) {
+          const allTypes = configs.map((c, i) => `  Config ${i+1}: ${(c.types||[]).join(", ")}`).join("\n");
+          lines.push(`ℹ️  No hay config de running en la API. Configs encontradas:\n${allTypes}\n`);
+        }
 
-          if (cfg.lthr)  lines.push(`   ❤️  LTHR: ${cfg.lthr} bpm`);
-          if (cfg.max_hr) lines.push(`   💓 FC máx: ${cfg.max_hr} bpm`);
-          if (cfg.ftp)   lines.push(`   ⚡ FTP: ${cfg.ftp} W`);
-          if (cfg.threshold_pace) lines.push(`   🏃 Ritmo umbral (CS): ${cfg.threshold_pace}`);
-          if (cfg.w_prime) lines.push(`   🔋 W' / D': ${cfg.w_prime}`);
+        // Get threshold pace — from running config or fallback to any config with it
+        const anyWithPace = configs.find(c => c.threshold_pace);
+        const cs_source   = runCfg?.threshold_pace || anyWithPace?.threshold_pace || null;
+        const lthr        = runCfg?.lthr || configs[0]?.lthr || null;
+        const maxHR       = runCfg?.max_hr || configs[0]?.max_hr || null;
+        const wPrime      = runCfg?.w_prime || null;
 
-          // HR zones
-          const hrz = cfg.hr_zones || [];
-          const hzn = cfg.hr_zone_names || [];
-          if (hrz.length) {
-            lines.push(`   Zonas FC: ${hrz.map((v, i) => `${hzn[i]||`Z${i+1}`}≤${v}`).join(" | ")}`);
-          }
+        lines.push(`🎯 UMBRALES`);
+        if (lthr)      lines.push(`   LTHR: ${lthr} bpm`);
+        if (maxHR)     lines.push(`   FC máxima: ${maxHR} bpm`);
+        if (cs_source) lines.push(`   CS / Ritmo umbral: ${cs_source}`);
+        if (wPrime)    lines.push(`   D': ${wPrime} m`);
+        lines.push("");
 
-          // Pace zones
-          const paz = cfg.pace_zones || [];
-          const pzn = cfg.pace_zone_names || [];
-          if (paz.length) {
-            lines.push(`   Zonas ritmo: ${paz.map((v, i) => `${pzn[i]||`Z${i+1}`}≤${v}`).join(" | ")}`);
-          }
+        // Calculate pace zones from CS
+        // Percentages from intervals.icu standard model confirmed from user's settings
+        const PACE_ZONES = [
+          { name: "Z1 (Recovery)",    pctMin: 0,     pctMax: 77.5  },
+          { name: "Z2 (Endurance)",   pctMin: 78.5,  pctMax: 87.7  },
+          { name: "Z3 (Tempo)",       pctMin: 88.7,  pctMax: 94.3  },
+          { name: "Z4 (Threshold)",   pctMin: 95.3,  pctMax: 100   },
+          { name: "Z5a (VO2max)",     pctMin: 101,   pctMax: 103.4 },
+          { name: "Z5b (Anaerobic)",  pctMin: 104.4, pctMax: 111.5 },
+          { name: "Z5c (Sprint)",     pctMin: 112.5, pctMax: 999   },
+        ];
 
-          lines.push("");
-        });
+        // Parse CS to seconds/km
+        const parseCS = (cs) => {
+          if (!cs) return null;
+          const parts = String(cs).split(":").map(Number);
+          if (parts.length === 2) return parts[0] * 60 + parts[1];
+          if (parts.length === 1) return parts[0];
+          return null;
+        };
+
+        const secPerKm = (secs) => {
+          const m = Math.floor(secs / 60);
+          const s = Math.round(secs % 60);
+          return `${m}:${String(s).padStart(2, "0")}`;
+        };
+
+        const csSource = runCfg?.threshold_pace || anyWithPace?.threshold_pace;
+        const csSecs   = parseCS(csSource);
+
+        if (csSecs) {
+          lines.push(`🏃 ZONAS RITMO (calculadas desde CS = ${csSource})`);
+          PACE_ZONES.forEach(z => {
+            const fast = z.pctMax >= 999 ? "<" + secPerKm(csSecs / 1.125) : secPerKm(csSecs / (z.pctMax / 100));
+            const slow = z.pctMin === 0 ? ">" + secPerKm(csSecs / 0.775) : secPerKm(csSecs / (z.pctMin / 100));
+            if (z.pctMin === 0) {
+              lines.push(`   ${z.name}: >${secPerKm(csSecs / (z.pctMax/100))} min/km`);
+            } else if (z.pctMax >= 999) {
+              lines.push(`   ${z.name}: <${secPerKm(csSecs / (z.pctMin/100))} min/km`);
+            } else {
+              lines.push(`   ${z.name}: ${secPerKm(csSecs / (z.pctMax/100))}–${secPerKm(csSecs / (z.pctMin/100))} min/km`);
+            }
+          });
+        } else {
+          lines.push(`🏃 ZONAS RITMO: CS no disponible en API.`);
+          lines.push(`   Para activarlas: intervals.icu → Settings → Deportes → Running → Ritmo umbral`);
+        }
+        lines.push("");
+
+        // HR zones from running config (or cycling as fallback)
+        const hrz = runCfg?.hr_zones || configs[0]?.hr_zones || [];
+        const hzn = runCfg?.hr_zone_names || configs[0]?.hr_zone_names || [];
+        if (hrz.length) {
+          lines.push(`❤️  ZONAS FC`);
+          let prev = 0;
+          hrz.forEach((upper, i) => {
+            lines.push(`   ${hzn[i]||`Z${i+1}`}: ${prev+1}–${upper} bpm`);
+            prev = upper;
+          });
+        }
 
         return { content: [{ type: "text", text: lines.join("\n") }] };
       } catch (err) {
