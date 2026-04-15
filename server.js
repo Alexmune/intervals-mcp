@@ -918,29 +918,67 @@ function createServer() {
   );
 
   srv.tool("create_event",
-    "Create a workout or event in the intervals.icu calendar",
+    "Create a workout or event in the intervals.icu calendar. Supports structured workouts with steps.",
     {
       date:          z.string().describe("Date YYYY-MM-DD"),
       name:          z.string().describe("Workout name"),
       type:          z.string().optional().describe("Run, Ride, Swim, WeightTraining, Rest (default: Run)"),
-      description:   z.string().optional().describe("Workout structure, zones, paces, notes"),
+      description:   z.string().optional().describe("Workout description text"),
       load:          z.number().optional().describe("Target TSS/load"),
       duration_mins: z.number().optional().describe("Planned duration in minutes"),
+      steps:         z.string().optional().describe("JSON array of workout steps. Each step: {type: 'warmup'|'steady'|'cooldown'|'rest', distance_m?: number, duration_secs?: number, pace_min?: number, pace_max?: number} where pace is seconds/km. E.g. '[{\"type\":\"warmup\",\"distance_m\":4000,\"pace_min\":300,\"pace_max\":330},{\"type\":\"steady\",\"distance_m\":11000,\"pace_min\":260,\"pace_max\":265},{\"type\":\"cooldown\",\"distance_m\":1000,\"pace_min\":340,\"pace_max\":360}]'"),
     },
-    async ({ date, name, type = "Run", description, load, duration_mins }) => {
+    async ({ date, name, type = "Run", description, load, duration_mins, steps }) => {
       try {
         const body = {
-          start_date_local: `${date}T08:00:00`,
+          start_date_local: `${date}T17:00:00`,
           name, type,
           category: "WORKOUT",
           description: description || "",
           ...(load          && { load }),
           ...(duration_mins && { moving_time: duration_mins * 60 }),
         };
+
+        // Build structured workout doc if steps provided
+        if (steps) {
+          try {
+            const parsedSteps = JSON.parse(steps);
+
+            // intervals.icu workout_doc format
+            const workoutSteps = parsedSteps.map((s) => {
+              const step = {
+                type: s.type === "warmup"   ? "Warmup"
+                     : s.type === "cooldown" ? "Cooldown"
+                     : s.type === "rest"     ? "Rest"
+                     : "SteadyState",
+              };
+
+              // Length by distance or duration
+              if (s.distance_m)    step.length = { value: s.distance_m, unit: "m" };
+              else if (s.duration_secs) step.length = { value: s.duration_secs, unit: "s" };
+
+              // Pace targets (seconds/km)
+              if (s.pace_min || s.pace_max) {
+                step.pace = {};
+                if (s.pace_min) step.pace.minSecs = s.pace_min;
+                if (s.pace_max) step.pace.maxSecs = s.pace_max;
+              }
+
+              return step;
+            });
+
+            body.icu_workout_doc = { steps: workoutSteps };
+          } catch (e) {
+            // If steps parsing fails, continue without structured workout
+          }
+        }
+
         const data = await callIntervals(`/athlete/${ATHLETE_ID}/events`, "POST", body);
-        return { content: [{ type: "text", text: `✅ ${date} — ${name} (${type}) [ID:${data.id || "ok"}]` }] };
+        const id   = data.id || "ok";
+        const hasStructure = !!body.icu_workout_doc;
+        return { content: [{ type: "text", text: `✅ ${date} — ${name} (${type}) [ID:${id}]${hasStructure ? " · con estructura de pasos" : ""}` }] };
       } catch (err) {
-        return { content: [{ type: "text", text: `❌ ${err.message}` }] };
+        return { content: [{ type: "text", text: `❌ create_event: ${err.message}` }] };
       }
     }
   );
