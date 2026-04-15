@@ -1016,6 +1016,8 @@ function createServer() {
       }
     }
   );
+
+  srv.tool("update_wellness",
     "Update wellness for a day: HRV, resting HR, sleep, weight, fatigue, mood, motivation, soreness, notes",
     {
       date:        z.string().describe("Date YYYY-MM-DD"),
