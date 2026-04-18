@@ -310,7 +310,7 @@ function createServer() {
   );
 
   srv.tool("get_activity_streams",
-    "Get per-second stream data: HR, cadence, pace, altitude, power. Calculates time in HR zones.",
+    "Get per-second stream data: HR, cadence, pace, altitude, power. Calculates time in HR zones AND per-km splits.",
     {
       activity_id:  z.string().describe("Activity ID e.g. i139521833"),
       stream_types: z.string().optional().describe("Comma-separated stream types (default: time,heartrate,cadence,velocity_smooth,altitude,distance)"),
@@ -325,11 +325,9 @@ function createServer() {
         try { raw = await callIntervals(`/activity/${activity_id}/streams?${params}`); }
         catch (_) { raw = await callIntervals(`/activity/${cleanId}/streams?${params}`); }
 
-        // API returns a LIST of stream objects: [{type, name, data, valueType}, ...]
         const streams = Array.isArray(raw) ? raw : (raw ? [raw] : []);
         if (!streams.length) return { content: [{ type: "text", text: "No hay streams para esta actividad." }] };
 
-        // Index streams by type
         const byType = {};
         streams.forEach(s => { if (s.type) byType[s.type] = s.data || []; });
 
@@ -341,10 +339,12 @@ function createServer() {
         const vel  = byType.velocity_smooth || byType.speed || byType.velocity || [];
         const cad  = byType.cadence || [];
         const alt  = byType.altitude || [];
+        const dist = byType.distance || [];
         const pwr  = byType.watts || byType.power || [];
 
         if (time.length) lines.push(`⏱ ${time.length} puntos · duración ${fmtDuration(time[time.length-1]||0)}`);
 
+        // ── Global HR summary ──────────────────────────────────────────────
         if (hr.length) {
           const v = hr.filter(x => x > 0);
           if (v.length) {
@@ -352,7 +352,6 @@ function createServer() {
             const max = Math.max(...v), min = Math.min(...v);
             lines.push(`\n❤️  FRECUENCIA CARDÍACA`);
             lines.push(`   Media: ${avg} bpm | Máx: ${max} bpm | Mín: ${min} bpm`);
-            // Zonas de Alex: Z1 ≤133, Z2 134-148, Z3 149-163, Z4 164-178, Z5 >178
             const z = [0,0,0,0,0];
             v.forEach(x => {
               if      (x <= 133) z[0]++;
@@ -374,8 +373,8 @@ function createServer() {
         if (vel.length) {
           const v = vel.filter(x => x > 0);
           if (v.length) {
-            const avg = v.reduce((a,b)=>a+b,0)/v.length;
-            const best = fmtPace(Math.max(...v)); // highest m/s = fastest pace
+            const avg  = v.reduce((a,b)=>a+b,0)/v.length;
+            const best = fmtPace(Math.max(...v));
             lines.push(`\n🏃 RITMO`);
             lines.push(`   Medio: ${fmtPace(avg)}`);
             if (best) lines.push(`   Mejor momento: ${best}`);
@@ -385,10 +384,8 @@ function createServer() {
         if (cad.length) {
           const v = cad.filter(x => x > 0);
           if (v.length) {
-            const avg = Math.round(v.reduce((a,b)=>a+b,0)/v.length);
-            const max = Math.max(...v);
             lines.push(`\n👟 CADENCIA`);
-            lines.push(`   Media: ${avg} spm | Máx: ${max} spm`);
+            lines.push(`   Media: ${Math.round(v.reduce((a,b)=>a+b,0)/v.length)} spm | Máx: ${Math.max(...v)} spm`);
           }
         }
 
@@ -401,8 +398,84 @@ function createServer() {
         if (pwr.length) {
           const v = pwr.filter(x => x > 0);
           if (v.length) {
-            const avg = Math.round(v.reduce((a,b)=>a+b,0)/v.length);
-            lines.push(`\n⚡ POTENCIA: media ${avg} W | máx ${Math.max(...v)} W`);
+            lines.push(`\n⚡ POTENCIA: media ${Math.round(v.reduce((a,b)=>a+b,0)/v.length)} W | máx ${Math.max(...v)} W`);
+          }
+        }
+
+        // ── Per-km splits ──────────────────────────────────────────────────
+        if (dist.length && (hr.length || vel.length)) {
+          const totalDist = dist[dist.length - 1] || 0;
+          const numKm     = Math.floor(totalDist / 1000);
+
+          if (numKm >= 1) {
+            lines.push(`\n📊 SPLITS POR KILÓMETRO`);
+            lines.push(`  ${"Km".padEnd(4)} ${"Ritmo".padEnd(9)} ${"FC".padEnd(7)} ${"Cad".padEnd(6)} Desnivel`);
+            lines.push(`  ${"─".repeat(42)}`);
+
+            for (let km = 1; km <= numKm; km++) {
+              const fromM = (km - 1) * 1000;
+              const toM   = km * 1000;
+
+              // Get indices for this km band
+              const idx = [];
+              dist.forEach((d, i) => { if (d >= fromM && d < toM) idx.push(i); });
+
+              if (!idx.length) continue;
+
+              // Average pace (velocity → min/km)
+              let paceStr = "   -  ";
+              if (vel.length) {
+                const vv = idx.map(i => vel[i]).filter(x => x > 0);
+                if (vv.length) paceStr = fmtPace(vv.reduce((a,b)=>a+b,0)/vv.length);
+              }
+
+              // Average HR
+              let hrStr = "  -  ";
+              if (hr.length) {
+                const hv = idx.map(i => hr[i]).filter(x => x > 0);
+                if (hv.length) hrStr = `${Math.round(hv.reduce((a,b)=>a+b,0)/hv.length)} bpm`;
+              }
+
+              // Average cadence
+              let cadStr = "  - ";
+              if (cad.length) {
+                const cv = idx.map(i => cad[i]).filter(x => x > 0);
+                if (cv.length) cadStr = `${Math.round(cv.reduce((a,b)=>a+b,0)/cv.length)} spm`;
+              }
+
+              // Elevation gain/loss for this km
+              let elevStr = "";
+              if (alt.length) {
+                const av   = idx.map(i => alt[i]);
+                const gain = Math.max(0, Math.round(av[av.length-1] - av[0]));
+                const loss = Math.max(0, Math.round(av[0] - av[av.length-1]));
+                if (gain > 0) elevStr = `↑${gain}m`;
+                if (loss > 0) elevStr += `${elevStr ? " " : ""}↓${loss}m`;
+              }
+
+              lines.push(`  ${String(km).padEnd(4)} ${paceStr.padEnd(9)} ${hrStr.padEnd(7)} ${cadStr.padEnd(6)} ${elevStr}`);
+            }
+
+            // Partial last km if any
+            const remainM = totalDist - numKm * 1000;
+            if (remainM > 50) {
+              const fromM = numKm * 1000;
+              const idx   = [];
+              dist.forEach((d, i) => { if (d >= fromM) idx.push(i); });
+              if (idx.length) {
+                let paceStr = "   -  ";
+                if (vel.length) {
+                  const vv = idx.map(i => vel[i]).filter(x => x > 0);
+                  if (vv.length) paceStr = fmtPace(vv.reduce((a,b)=>a+b,0)/vv.length);
+                }
+                let hrStr = "  -  ";
+                if (hr.length) {
+                  const hv = idx.map(i => hr[i]).filter(x => x > 0);
+                  if (hv.length) hrStr = `${Math.round(hv.reduce((a,b)=>a+b,0)/hv.length)} bpm`;
+                }
+                lines.push(`  ${(numKm + 1 + "*").padEnd(4)} ${paceStr.padEnd(9)} ${hrStr.padEnd(7)} (${Math.round(remainM)}m parcial)`);
+              }
+            }
           }
         }
 
