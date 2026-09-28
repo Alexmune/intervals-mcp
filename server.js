@@ -164,8 +164,8 @@ async function getHrZoneUpper() {
     const cfg = await getRunConfig();
     if (zoneCache.upper) return zoneCache.upper;
     let upper = null;
-    if (Array.isArray(cfg?.hr_zones) && cfg.hr_zones.length >= 5) {
-      upper = cfg.hr_zones.slice(0, 5).map(Number);
+    if (Array.isArray(cfg?.hr_zones) && cfg.hr_zones.length >= 3) {
+      upper = cfg.hr_zones.map(Number);
     } else if (cfg?.lthr) {
       const l = cfg.lthr, max = cfg.max_hr || DEFAULT_HR_UPPER[4];
       upper = [Math.floor(l * 0.76), Math.floor(l * 0.85), Math.floor(l * 0.93), Math.floor(l * 1.02), max];
@@ -177,8 +177,11 @@ async function getHrZoneUpper() {
   }
 }
 
-const zoneLabels = (u) => [`Z1 (≤${u[0]})`, `Z2 (${u[0]+1}-${u[1]})`, `Z3 (${u[1]+1}-${u[2]})`, `Z4 (${u[2]+1}-${u[3]})`, `Z5 (>${u[3]})`];
-const zoneOf = (hr, u) => hr <= u[0] ? 0 : hr <= u[1] ? 1 : hr <= u[2] ? 2 : hr <= u[3] ? 3 : 4;
+// Nombres: 7 zonas → Z1-Z4, Z5a, Z5b, Z5c (modelo intervals) · otro nº → Z1…ZN
+const zoneNames = (n) => n === 7 ? ["Z1","Z2","Z3","Z4","Z5a","Z5b","Z5c"] : Array.from({ length: n }, (_, i) => `Z${i + 1}`);
+const zoneLabels = (u) => zoneNames(u.length).map((name, i) =>
+  i === 0 ? `${name} (≤${u[0]})` : i === u.length - 1 ? `${name} (>${u[i - 1]})` : `${name} (${u[i - 1] + 1}-${u[i]})`);
+const zoneOf = (hr, u) => { const i = u.findIndex(x => hr <= x); return i === -1 ? u.length - 1 : i; };
 
 // ─── Desacoplamiento aeróbico (Pa:HR) ─────────────────────────────────────────
 // Divide el tramo en dos mitades de igual tiempo y compara la eficiencia (velocidad/FC).
@@ -242,7 +245,7 @@ function bestEffort(time, rawDist, targetM) {
 
 // ─── MCP Server factory ───────────────────────────────────────────────────────
 function createServer() {
-  const srv = new McpServer({ name: "intervals-mcp", version: "5.0.0" });
+  const srv = new McpServer({ name: "intervals-mcp", version: "5.1.0" });
 
   srv.tool("get_athlete_profile",
     "Get full athlete profile: demographics, weight, HR zones, pace zones, FTP, VO2max, thresholds. Dumps all available fields.",
@@ -501,8 +504,8 @@ function createServer() {
         if (zt.length) {
           lines.push(`\n📊 TIEMPO EN ZONAS FC`);
           const zn = zoneLabels(u);
-          const tot = zt.slice(0, 5).reduce((x, y) => x + (y || 0), 0) || 1;
-          zt.slice(0, 5).forEach((sec, i) => { const m = Math.round((sec||0)/60); if (m > 0) lines.push(`   ${zn[i]}: ${m} min (${Math.round((sec||0)/tot*100)}%)`); });
+          const tot = zt.slice(0, u.length).reduce((x, y) => x + (y || 0), 0) || 1;
+          zt.slice(0, u.length).forEach((sec, i) => { const m = Math.round((sec||0)/60); if (m > 0) lines.push(`   ${zn[i]}: ${m} min (${Math.round((sec||0)/tot*100)}%)`); });
         }
 
         const laps = a.laps || [];
@@ -585,7 +588,7 @@ function createServer() {
             lines.push(`\n❤️  FRECUENCIA CARDÍACA`);
             lines.push(`   Media: ${avg} bpm | Máx: ${max} bpm | Mín: ${min} bpm`);
             const u = await getHrZoneUpper();
-            const z = [0,0,0,0,0];
+            const z = new Array(u.length).fill(0);
             v.forEach(x => { z[zoneOf(x, u)]++; });
             const tot = v.length;
             const zn  = zoneLabels(u);
@@ -1162,8 +1165,12 @@ function createServer() {
           { name: "Z5 Interval",    pctMax: 99    },
         ];
         const lthrVal = lthr || runCfg?.lthr || configs[0]?.lthr;
+        if (Array.isArray(runCfg?.hr_zones) && runCfg.hr_zones.length) {
+          lines.push(`\n❤️  ZONAS FC CONFIGURADAS EN INTERVALS (las que usan todos los análisis)`);
+          zoneLabels(runCfg.hr_zones.map(Number)).forEach(l => lines.push(`   ${l} bpm`));
+        }
         if (lthrVal) {
-          lines.push(`\n❤️  ZONAS FC (calculadas desde LTHR = ${lthrVal} bpm)`);
+          lines.push(`\n❤️  ZONAS FC TEÓRICAS (calculadas desde LTHR = ${lthrVal} bpm, modelo 5 zonas)`);
           let prev = 0;
           HR_ZONES.forEach(z => {
             const upper = z.pctMax >= 99 ? maxHR || 193 : Math.round(lthrVal * z.pctMax);
@@ -1383,7 +1390,7 @@ function createServer() {
         const [wData, evData, actData] = await Promise.all([
           callIntervals(`/athlete/${ATHLETE_ID}/wellness?${wParams}`),
           callIntervals(`/athlete/${ATHLETE_ID}/events?${new URLSearchParams({ oldest: d, newest: addDays(d, 1) })}`),
-          callIntervals(`/athlete/${ATHLETE_ID}/activities?${new URLSearchParams({ oldest: [addDays(d, -3), mondayOf(d)].sort()[0], newest: d })}`),
+          callIntervals(`/athlete/${ATHLETE_ID}/activities?${new URLSearchParams({ oldest: [addDays(d, -14), mondayOf(d)].sort()[0], newest: d })}`),
         ]);
         const wl   = toArray(wData, "wellness").sort((a, b) => String(a.id).localeCompare(String(b.id)));
         const w    = wl.find(x => x.id === d) || {};
@@ -1443,7 +1450,9 @@ function createServer() {
         if (last) {
           const dec = firstDefined(last.decoupling, last.icu_decoupling);
           const rpe = firstDefined(last.icu_rpe, last.perceived_exertion);
-          L.push(``, `🏃 ÚLTIMA ACTIVIDAD — ${(last.start_date_local||"").split("T")[0]} [ID:${last.id}]`);
+          const lastDate = (last.start_date_local||"").split("T")[0];
+          const gap = Math.round((new Date(`${d}T12:00:00Z`) - new Date(`${lastDate}T12:00:00Z`)) / 86400000);
+          L.push(``, `🏃 ÚLTIMA ACTIVIDAD — ${lastDate}${gap >= 3 ? ` (hace ${gap} días — ¿falta sincronizar?)` : ""} [ID:${last.id}]`);
           L.push(`   ${last.name || last.type}: ${last.distance ? (last.distance/1000).toFixed(2) + " km · " : ""}${fmtDuration(last.moving_time)}${last.average_speed ? " · " + fmtPace(last.average_speed) : ""}${last.average_heartrate ? " · " + fmt0(last.average_heartrate) + " bpm" : ""}`);
           const extra = [
             firstDefined(last.icu_training_load, last.tss) != null ? `carga ${fmt0(firstDefined(last.icu_training_load, last.tss))}` : null,
@@ -1533,8 +1542,9 @@ function createServer() {
       threshold_pace: z.string().optional().describe("Nuevo ritmo umbral / CS en formato m:ss por km (ej: '4:02')"),
       d_prime:        z.number().optional().describe("Nuevo D' en metros"),
       rescale_hr_zones: z.boolean().optional().describe("Reescalar zonas FC al nuevo LTHR (default: true)"),
+      hr_zones:       z.array(z.number()).optional().describe("Fijar zonas FC explícitas: límites superiores en bpm, el último = FC máx. Ej: [133,148,163,178,193]"),
     },
-    async ({ lthr, max_hr, threshold_pace, d_prime, rescale_hr_zones = true }) => {
+    async ({ lthr, max_hr, threshold_pace, d_prime, rescale_hr_zones = true, hr_zones }) => {
       try {
         const cfg = await getRunConfig(true);
         if (!cfg?.id) return { content: [{ type: "text", text: "❌ No se encontró la configuración de running en intervals." }] };
@@ -1550,10 +1560,22 @@ function createServer() {
           after.push(`CS ${threshold_pace}/km`);
         }
         if (d_prime != null) { body.w_prime = d_prime; before.push(`D' ${cfg.w_prime ?? "?"}`); after.push(`D' ${d_prime}`); }
+        let newZones = null;
+        if (hr_zones?.length) {
+          const sorted = [...hr_zones].map(Number);
+          if (sorted.some((v, i) => i > 0 && v <= sorted[i - 1])) return { content: [{ type: "text", text: "❌ Las zonas deben ser límites superiores crecientes." }] };
+          newZones = sorted;
+          body.hr_zones = sorted;
+          if (Array.isArray(cfg.hr_zone_names)) {
+            const DEF5 = ["Recovery", "Endurance", "Tempo", "Threshold", "Interval"];
+            body.hr_zone_names = sorted.length === 5 ? DEF5 : zoneNames(sorted.length);
+          }
+          before.push(`zonas FC ${(cfg.hr_zones || []).join("/")}`);
+          after.push(`zonas FC ${sorted.join("/")}`);
+        }
         if (!Object.keys(body).length) return { content: [{ type: "text", text: "⚠️ No hay nada que actualizar." }] };
 
-        let newZones = null;
-        if (rescale_hr_zones && Array.isArray(cfg.hr_zones) && cfg.hr_zones.length && (lthr != null || max_hr != null)) {
+        if (!newZones && rescale_hr_zones && Array.isArray(cfg.hr_zones) && cfg.hr_zones.length && (lthr != null || max_hr != null)) {
           const ratio = lthr != null && cfg.lthr ? lthr / cfg.lthr : 1;
           newZones = cfg.hr_zones.map((z, i, arr) => i === arr.length - 1 ? (max_hr ?? cfg.max_hr ?? z) : Math.round(z * ratio));
           body.hr_zones = newZones;
@@ -1602,16 +1624,23 @@ function createServer() {
         const res = await callIntervals(`/athlete/${ATHLETE_ID}/events/bulk`, "POST", bodies);
         const created = Array.isArray(res) ? res : toArray(res, "events");
 
+        // intervals devuelve los eventos ordenados por fecha → emparejar por fecha + nombre, nunca por posición
+        const pool = [...created];
+        const matched = events.map(e => {
+          const k = pool.findIndex(c => (c.start_date_local || "").startsWith(e.date) && c.name === e.name);
+          return k === -1 ? null : pool.splice(k, 1)[0];
+        });
+
         // Fijar duración de las sesiones de fuerza
         await Promise.all(events.map(async (e, i) => {
-          const c = created[i];
+          const c = matched[i];
           if (c?.id && e.duration_mins && /weight|strength/i.test(e.type || "")) {
             try { await callIntervals(`/athlete/${ATHLETE_ID}/events/${c.id}`, "PUT", { moving_time: e.duration_mins * 60 }); } catch (_) {}
           }
         }));
 
         const L = [`✅ ${created.length || events.length} eventos creados`];
-        events.forEach((e, i) => L.push(`   ${e.date} — ${e.name} (${e.type || "Run"})${created[i]?.id ? ` [ID:${created[i].id}]` : ""}`));
+        events.forEach((e, i) => L.push(`   ${e.date} — ${e.name} (${e.type || "Run"})${matched[i]?.id ? ` [ID:${matched[i].id}]` : ""}`));
         return { content: [{ type: "text", text: L.join("\n") }] };
       } catch (err) {
         return { content: [{ type: "text", text: `❌ create_events_bulk: ${err.message}` }] };
@@ -1803,9 +1832,9 @@ app.delete(MCP_PATHS, requireAuth, async (req, res) => {
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/health", (_, res) => res.json({
-  status: "ok", version: "5.0.0", transport: "streamable-http", sessions: sessions.size, auth: !!AUTH_TOKEN
+  status: "ok", version: "5.1.0", transport: "streamable-http", sessions: sessions.size, auth: !!AUTH_TOKEN
 }));
 
 app.listen(PORT, () => {
-  console.log(`✅ Intervals MCP v5 (Streamable HTTP) — port ${PORT} — athlete ${ATHLETE_ID} — ${AUTH_TOKEN ? "🔒 token activo" : "⚠️ SIN token: endpoint abierto"}`);
+  console.log(`✅ Intervals MCP v5.1 (Streamable HTTP) — port ${PORT} — athlete ${ATHLETE_ID} — ${AUTH_TOKEN ? "🔒 token activo" : "⚠️ SIN token: endpoint abierto"}`);
 });

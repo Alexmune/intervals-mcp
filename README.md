@@ -39,6 +39,14 @@ Si `MCP_AUTH_TOKEN` está definido, `/sse` sin token devuelve 401. También se a
 
 ---
 
+## Novedades v5.1.0 (tras pruebas con la API real)
+
+- `create_events_bulk`: intervals devuelve los eventos ordenados por fecha → ahora se emparejan por fecha + nombre (antes la corrección de duración de fuerza podía caer en otro evento)
+- Zonas FC: soporte para cualquier número de zonas (intervals usa 7: Z1-Z4, Z5a, Z5b, Z5c)
+- `get_sport_settings`: muestra las zonas FC reales configuradas en intervals además de las teóricas
+- `update_sport_settings`: nuevo parámetro `hr_zones` para fijar zonas explícitas
+- `get_daily_briefing`: busca la última actividad hasta 14 días atrás y avisa si hace ≥3 días (posible fallo de sincronización)
+
 ## Novedades v5.0.0
 
 **Herramientas nuevas (7):**
