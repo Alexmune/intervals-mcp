@@ -10,7 +10,7 @@ Servidor MCP (Model Context Protocol) para conectar Claude con la API de [Interv
 - **URL:** `https://intervals-mcp-production-2be3.up.railway.app/sse`
 - **Protocolo:** Streamable HTTP (POST /sse) — requerido por Claude.ai
 - **Runtime:** Node.js 18, Express
-- **Variables de entorno:** `INTERVALS_API_KEY`, `INTERVALS_ATHLETE_ID`
+- **Variables de entorno:** `INTERVALS_API_KEY`, `INTERVALS_ATHLETE_ID`, `MCP_AUTH_TOKEN` (recomendada), `TIMEZONE` (opcional)
 
 ---
 
@@ -19,8 +19,11 @@ Servidor MCP (Model Context Protocol) para conectar Claude con la API de [Interv
 En Claude.ai → Settings → Connectors → Add MCP Server:
 
 ```
-URL: https://intervals-mcp-production-2be3.up.railway.app/sse
+URL (con token):  https://intervals-mcp-production-2be3.up.railway.app/mcp/<MCP_AUTH_TOKEN>
+URL (sin token):  https://intervals-mcp-production-2be3.up.railway.app/sse
 ```
+
+Si `MCP_AUTH_TOKEN` está definido, `/sse` sin token devuelve 401. También se acepta `/sse?token=<TOKEN>` o la cabecera `Authorization: Bearer <TOKEN>`.
 
 ---
 
@@ -31,10 +34,38 @@ URL: https://intervals-mcp-production-2be3.up.railway.app/sse
 | `INTERVALS_API_KEY` | API key de intervals.icu (Settings → Developer) |
 | `INTERVALS_ATHLETE_ID` | ID del atleta (e.g. `i553313`) |
 | `PORT` | Puerto (Railway lo asigna automáticamente) |
+| `MCP_AUTH_TOKEN` | Secreto largo (32+ caracteres, solo letras y números) que protege el endpoint. Sin él, cualquiera con la URL puede leer y escribir en el calendario |
+| `TIMEZONE` | Zona horaria del atleta (default `Europe/Madrid`) |
 
 ---
 
-## Tools disponibles (21)
+## Novedades v5.0.0
+
+**Herramientas nuevas (7):**
+
+| Tool | Qué hace |
+|---|---|
+| `get_daily_briefing` | Informe matutino en 1 llamada: HRV vs baseline 30d (media ± SD), FC reposo, sueño (Xh XXmin), CTL/ATL/TSB, entrenos de hoy y mañana, última actividad, km de la semana y alertas automáticas |
+| `get_decoupling` | Desacoplamiento Pa:HR de una actividad o de un tramo (`from_km`/`to_km`), p.ej. el bloque a ritmo maratón de una tirada |
+| `update_activity` | Escribe RPE (1-10), feel (1-5), nombre, descripción o añade una nota de diario a una actividad |
+| `update_sport_settings` | Actualiza LTHR, FC máx, ritmo umbral/CS (m:ss) y D'. Reescala las zonas FC |
+| `create_events_bulk` | Crea la semana completa en una sola llamada. Fija automáticamente la duración de las sesiones de fuerza |
+| `get_gear` | Kilometraje de zapatillas/material |
+| `get_best_efforts` | Mejores esfuerzos (1k-30k) desde los streams + predicción de maratón (Riegel) |
+
+**Mejoras y correcciones:**
+- `get_activity_detail`: funciona con actividades de cualquier fecha (antes solo 60 días); añade GAP, carga, intensidad, TRIMP, desacoplamiento (de intervals o calculado desde streams), Efficiency Factor, RPE/feel y material
+- Zonas de FC leídas de intervals en vez de fijas en el código → si cambia el LTHR, todos los análisis se actualizan
+- `get_activity_streams`: nuevo parámetro `compact` (una línea por km) para ahorrar contexto
+- `get_wellness`: sueño en formato Xh XXmin
+- `get_performance_data`: corregida la conversión de la CS (m/s → min/km)
+- `create_event`: corrige automáticamente la duración de las sesiones de fuerza
+- Fechas calculadas en hora de Madrid (antes UTC: entre las 00:00 y 02:00 "hoy" era ayer)
+- Autenticación opcional por token
+
+---
+
+## Tools disponibles (27)
 
 ### 📊 Perfil y configuración del atleta
 
