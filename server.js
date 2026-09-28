@@ -18,6 +18,19 @@ if (!API_KEY || !ATHLETE_ID) {
 }
 
 // ─── Intervals API helper ─────────────────────────────────────────────────────
+// Límite de peticiones simultáneas a intervals + reintentos ante 429/5xx
+const MAX_CONCURRENT = 3;
+let inFlight = 0; const waiters = [];
+async function acquireSlot() {
+  if (inFlight < MAX_CONCURRENT) { inFlight++; return; }
+  await new Promise(r => waiters.push(r)); // el hueco se transfiere directamente
+}
+function releaseSlot() {
+  const next = waiters.shift();
+  if (next) next(); else inFlight--;
+}
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
 async function callIntervals(path, method = "GET", body = null) {
   const credentials = Buffer.from(`API_KEY:${API_KEY}`).toString("base64");
   const options = {
@@ -28,14 +41,35 @@ async function callIntervals(path, method = "GET", body = null) {
     },
   };
   if (body) options.body = JSON.stringify(body);
-  const res = await fetch(`${BASE_URL}${path}`, options);
-  if (!res.ok) {
+  const MAX_RETRIES = 4;
+  for (let attempt = 0; ; attempt++) {
+    await acquireSlot();
+    let res;
+    try { res = await fetch(`${BASE_URL}${path}`, options); }
+    catch (e) {
+      releaseSlot();
+      if (attempt < MAX_RETRIES) { await sleep(500 * 2 ** attempt); continue; }
+      console.warn(`⚠️ intervals ${method} ${path.split("?")[0]}: ${e.message}`);
+      throw e;
+    }
+    releaseSlot();
+    if (res.ok) {
+      const text = await res.text();
+      if (!text || text.trim() === "") return {};
+      return JSON.parse(text);
+    }
+    const retryable = res.status === 429 || res.status >= 500;
+    if (retryable && attempt < MAX_RETRIES) {
+      const ra = parseFloat(res.headers.get("retry-after"));
+      const wait = !isNaN(ra) ? ra * 1000 : 600 * 2 ** attempt + Math.random() * 300;
+      console.warn(`⏳ intervals ${res.status} en ${path.split("?")[0]} — reintento ${attempt + 1} en ${Math.round(wait)} ms`);
+      await sleep(wait);
+      continue;
+    }
     const text = await res.text();
+    if (res.status !== 404) console.warn(`⚠️ intervals ${res.status} en ${method} ${path.split("?")[0]}`);
     throw new Error(`Intervals API ${res.status}: ${text}`);
   }
-  const text = await res.text();
-  if (!text || text.trim() === "") return {};
-  return JSON.parse(text);
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -274,7 +308,7 @@ function bestEffort(time, rawDist, targetM) {
 
 // ─── MCP Server factory ───────────────────────────────────────────────────────
 function createServer() {
-  const srv = new McpServer({ name: "intervals-mcp", version: "6.3.0" });
+  const srv = new McpServer({ name: "intervals-mcp", version: "6.4.0" });
 
   srv.tool("get_athlete_profile",
     "Get full athlete profile: demographics, weight, HR zones, pace zones, FTP, VO2max, thresholds. Dumps all available fields.",
@@ -1712,8 +1746,8 @@ function createServer() {
 
         const DIST = [[1000,"1 km"],[3000,"3 km"],[5000,"5 km"],[10000,"10 km"],[15000,"15 km"],[21097.5,"Media"],[30000,"30 km"]];
         const best = {};
-        for (let i = 0; i < acts.length; i += 5) {
-          const batch = acts.slice(i, i + 5);
+        for (let i = 0; i < acts.length; i += 3) {
+          const batch = acts.slice(i, i + 3);
           const results = await Promise.all(batch.map(a => fetchStreams(a.id, "time,distance").then(st => ({ a, st })).catch(() => null)));
           for (const r of results) {
             if (!r) continue;
@@ -1773,6 +1807,7 @@ function createServer() {
           .sort((a, b) => String(a.start_date_local).localeCompare(String(b.start_date_local)));
 
         const segs = [];
+        const failed = [];
         const inBandSp = (sp) => sp >= vLo && sp <= vHi;
         const tOfSt = (st, x) => st.time.length ? st.time[x] : x;
 
@@ -1799,17 +1834,17 @@ function createServer() {
                       hrNorm: m.hr * (vT / m.vg), dec: m.dec, up: m.up });
         };
 
-        for (let i = 0; i < acts.length; i += 5) {
-          const batch = acts.slice(i, i + 5);
+        for (let i = 0; i < acts.length; i += 3) {
+          const batch = acts.slice(i, i + 3);
           await Promise.all(batch.map(async (a) => {
             // ── 1) Intervalos de intervals (pasos del entreno estructurado o vueltas) ──
-            let ivs = [];
+            let ivs = [], ivErr = null;
             try {
               let raw;
               try { raw = await callIntervals(`/activity/${a.id}/intervals`); }
-              catch (_) { raw = await callIntervals(`/activity/${cleanId(a.id)}/intervals`); }
+              catch (e) { if (!/ 404/.test(e.message)) throw e; raw = await callIntervals(`/activity/${cleanId(a.id)}/intervals`); }
               ivs = (raw?.icu_intervals || []).filter(iv => (iv.distance || 0) > 0 && (iv.moving_time || iv.elapsed_time || 0) > 0);
-            } catch (_) {}
+            } catch (e) { if (!/ 404/.test(e.message)) ivErr = e; }
             ivs.sort((x, y) => (x.start_index ?? 0) - (y.start_index ?? 0));
 
             // Agrupar intervalos consecutivos dentro de la banda
@@ -1855,7 +1890,8 @@ function createServer() {
             }
 
             // ── 2) Respaldo: detección sobre los streams (carreras sin vueltas útiles) ──
-            if (!await loadStreams()) return;
+            if (!await loadStreams()) { failed.push((a.start_date_local || "").split("T")[0]); return; }
+            if (ivErr) failed.push(`${(a.start_date_local || "").split("T")[0]} (solo GPS)`);
             const n = Math.min(st.vel.length, st.dist.length);
             if (n < 300 || !st.hr.length) return;
             const rv = new Array(n); let acc = 0;
@@ -1871,7 +1907,8 @@ function createServer() {
           }));
         }
         segs.sort((x, y) => x.date.localeCompare(y.date) || x.startKm - y.startKm);
-        if (!segs.length) return { content: [{ type: "text", text: `No hay tramos de ≥${min_km} km entre ${pace_fast} y ${pace_slow}/km en los últimos ${nDays} días.` }] };
+        const failNote = failed.length ? `\n⚠️ ${failed.length} actividad(es) no se pudieron leer completas: ${failed.join(", ")}. Repetir la consulta en unos minutos.` : "";
+        if (!segs.length) return { content: [{ type: "text", text: failNote + `\nNo hay tramos de ≥${min_km} km entre ${pace_fast} y ${pace_slow}/km en los últimos ${nDays} días.` }] };
 
         const L = [`🎯 COSTE CARDÍACO DEL RITMO MARATÓN — banda ${pace_fast}-${pace_slow}/km · normalizado a ${target_pace}`,
                    `   ${segs.length} tramos en ${new Set(segs.map(s => s.date)).size} sesiones (últimos ${nDays} días)`, ``,
@@ -1909,7 +1946,8 @@ function createServer() {
         if (fresh.length && tired.length) L.push(`   Últimas 4 semanas — fresco: ${Math.round(wavg(fresh))} bpm · con fatiga (km 15+): ${Math.round(wavg(tired))} bpm (${wavg(tired) >= wavg(fresh) ? "+" : ""}${Math.round(wavg(tired) - wavg(fresh))})`);
         if (decs.length) L.push(`   Desacoplamiento medio (tramos ≥20 min, últimas 4 semanas): ${fmt1(mean(decs))}%`);
         L.push(`   Km a ritmo maratón últimas 4 semanas: ${recent.reduce((a, s) => a + s.km, 0).toFixed(1)} km · tramo más largo: ${Math.max(...recent.map(s => s.km), 0).toFixed(1)} km`);
-        L.push(``, `ℹ️ Tramos detectados por ritmo ajustado a pendiente (GAP aprox.). FC@objetivo = FC × velocidad objetivo / velocidad GAP. Contrastar siempre con calor y sueño del día.`);
+        L.push(``, `ℹ️ Tramos tomados de los intervalos de intervals (o del GPS si no hay vueltas). FC@objetivo = FC × velocidad objetivo / velocidad GAP. Contrastar siempre con calor y sueño del día.`);
+        if (failNote) L.push(failNote);
         return { content: [{ type: "text", text: L.join("\n") }] };
       } catch (err) {
         return { content: [{ type: "text", text: `❌ get_mp_trend: ${err.message}` }] };
@@ -2174,9 +2212,9 @@ app.delete(MCP_PATHS, requireAuth, async (req, res) => {
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/health", (_, res) => res.json({
-  status: "ok", version: "6.3.0", transport: "streamable-http", sessions: sessions.size, auth: !!AUTH_TOKEN
+  status: "ok", version: "6.4.0", transport: "streamable-http", sessions: sessions.size, auth: !!AUTH_TOKEN
 }));
 
 app.listen(PORT, () => {
-  console.log(`✅ Intervals MCP v6.3 (Streamable HTTP) — port ${PORT} — athlete ${ATHLETE_ID} — ${AUTH_TOKEN ? "🔒 token activo" : "⚠️ SIN token: endpoint abierto"}`);
+  console.log(`✅ Intervals MCP v6.4 (Streamable HTTP) — port ${PORT} — athlete ${ATHLETE_ID} — ${AUTH_TOKEN ? "🔒 token activo" : "⚠️ SIN token: endpoint abierto"}`);
 });

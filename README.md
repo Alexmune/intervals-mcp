@@ -39,6 +39,12 @@ Si `MCP_AUTH_TOKEN` está definido, `/sse` sin token devuelve 401. También se a
 
 ---
 
+## Novedades v6.4.0
+
+- Todas las llamadas a intervals: máximo 3 peticiones simultáneas y reintentos automáticos con espera progresiva ante 429 (límite de peticiones) y errores 5xx. Antes, un 429 hacía que actividades desaparecieran en silencio de `get_mp_trend` y `get_best_efforts`
+- Los errores de intervals se registran en los logs de Railway (`⏳` reintento, `⚠️` fallo)
+- `get_mp_trend` avisa si alguna actividad no se pudo leer
+
 ## Novedades v6.3.0
 
 - `get_mp_trend`: fuente principal = intervalos de intervals (pasos del entreno estructurado o vueltas), uniendo los consecutivos dentro de la banda (sirve también con autolap de 1 km). Distancia y ritmo exactos del intervalo; GAP, FC sin retardo inicial y desacoplamiento desde los streams. La detección por GPS queda como respaldo para carreras sin vueltas (marcada con *)

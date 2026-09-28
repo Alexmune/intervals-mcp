@@ -1,6 +1,6 @@
 {
   "name": "intervals-mcp-server",
-  "version": "6.3.0",
+  "version": "6.4.0",
   "description": "MCP Server for intervals.icu",
   "type": "module",
   "main": "server.js",
