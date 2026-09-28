@@ -39,6 +39,10 @@ Si `MCP_AUTH_TOKEN` está definido, `/sse` sin token devuelve 401. También se a
 
 ---
 
+## Novedades v6.3.0
+
+- `get_mp_trend`: fuente principal = intervalos de intervals (pasos del entreno estructurado o vueltas), uniendo los consecutivos dentro de la banda (sirve también con autolap de 1 km). Distancia y ritmo exactos del intervalo; GAP, FC sin retardo inicial y desacoplamiento desde los streams. La detección por GPS queda como respaldo para carreras sin vueltas (marcada con *)
+
 ## Novedades v6.2.0
 
 - `project_fitness`: calibración automática de la carga planificada. intervals calcula la carga de los entrenos planificados con un modelo por ritmo que puede diferir mucho de la real (por FC); ahora se escala con el factor real/planificado de las últimas 8 semanas. Muestra también la conversión real TSS/km

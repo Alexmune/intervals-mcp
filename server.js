@@ -274,7 +274,7 @@ function bestEffort(time, rawDist, targetM) {
 
 // ─── MCP Server factory ───────────────────────────────────────────────────────
 function createServer() {
-  const srv = new McpServer({ name: "intervals-mcp", version: "6.2.0" });
+  const srv = new McpServer({ name: "intervals-mcp", version: "6.3.0" });
 
   srv.tool("get_athlete_profile",
     "Get full athlete profile: demographics, weight, HR zones, pace zones, FTP, VO2max, thresholds. Dumps all available fields.",
@@ -1773,52 +1773,104 @@ function createServer() {
           .sort((a, b) => String(a.start_date_local).localeCompare(String(b.start_date_local)));
 
         const segs = [];
+        const inBandSp = (sp) => sp >= vLo && sp <= vHi;
+        const tOfSt = (st, x) => st.time.length ? st.time[x] : x;
+
+        // Métricas de un tramo [start..last] a partir de los streams (GAP, FC sin retardo, desnivel, desacoplamiento)
+        const enrich = (st, gv, start, last) => {
+          const { hr, dist, alt } = st;
+          const segM = (dist[last] || 0) - (dist[start] || 0);
+          const secs = tOfSt(st, last) - tOfSt(st, start);
+          if (segM <= 0 || secs <= 0) return null;
+          const hrFrom = secs > 300 ? start + Math.min(90, Math.floor((last - start) / 4)) : start;
+          const hrVals = []; for (let x = hrFrom; x <= last; x++) if (hr[x] > 60) hrVals.push(hr[x]);
+          const gVals = []; for (let x = start; x <= last; x++) gVals.push(gv[x]);
+          let up = 0;
+          if (alt.length) { for (let x = start + 10; x <= last; x += 10) { const dz = (alt[x] || 0) - (alt[x - 10] || 0); if (dz > 0) up += dz; } }
+          const dec = secs >= 1200 ? computeDecoupling({ ...st, vel: gv }, dist[start], dist[last]) : null;
+          return { startKm: (dist[start] || 0) / 1000, km: segM / 1000, v: segM / secs, vg: mean(gVals) || segM / secs,
+                   hr: hrVals.length >= 60 ? mean(hrVals) : null, up, dec: dec ? dec.decoupling : null };
+        };
+
+        const pushSeg = (a, m, src) => {
+          if (!m || !m.hr) return;
+          segs.push({ date: (a.start_date_local || "").split("T")[0], name: a.name || "", src,
+                      startKm: m.startKm, km: m.km, pace: 1000 / m.v, gap: 1000 / m.vg, hr: m.hr,
+                      hrNorm: m.hr * (vT / m.vg), dec: m.dec, up: m.up });
+        };
+
         for (let i = 0; i < acts.length; i += 5) {
           const batch = acts.slice(i, i + 5);
-          const res = await Promise.all(batch.map(a => fetchStreams(a.id, "time,heartrate,velocity_smooth,distance,altitude").then(st => ({ a, st })).catch(() => null)));
-          for (const r of res) {
-            if (!r) continue;
-            const { time, hr, vel, dist, alt } = r.st;
-            const n = Math.min(vel.length, dist.length);
-            if (n < 300 || !hr.length) continue;
-            // Media móvil de 60 s de la velocidad AJUSTADA A PENDIENTE (las cuestas no rompen el tramo)
-            const gv = gapVelocity(vel.slice(0, n), dist, alt);
+          await Promise.all(batch.map(async (a) => {
+            // ── 1) Intervalos de intervals (pasos del entreno estructurado o vueltas) ──
+            let ivs = [];
+            try {
+              let raw;
+              try { raw = await callIntervals(`/activity/${a.id}/intervals`); }
+              catch (_) { raw = await callIntervals(`/activity/${cleanId(a.id)}/intervals`); }
+              ivs = (raw?.icu_intervals || []).filter(iv => (iv.distance || 0) > 0 && (iv.moving_time || iv.elapsed_time || 0) > 0);
+            } catch (_) {}
+            ivs.sort((x, y) => (x.start_index ?? 0) - (y.start_index ?? 0));
+
+            // Agrupar intervalos consecutivos dentro de la banda
+            const groups = []; let cur = null, before = 0; const startDist = [];
+            ivs.forEach(iv => {
+              startDist.push(before); before += iv.distance || 0;
+              const sp = iv.average_speed || (iv.distance / (iv.moving_time || iv.elapsed_time));
+              if (inBandSp(sp)) { (cur = cur || []).push(iv); } else { if (cur) groups.push(cur); cur = null; }
+            });
+            if (cur) groups.push(cur);
+            const cands = groups.map(g => {
+              const dist = g.reduce((s, iv) => s + (iv.distance || 0), 0);
+              const secs = g.reduce((s, iv) => s + (iv.moving_time || iv.elapsed_time || 0), 0);
+              const hrW  = g.reduce((s, iv) => s + (iv.average_heartrate || 0) * (iv.moving_time || iv.elapsed_time || 0), 0);
+              return { dist, secs, hr: secs ? hrW / secs : null, startIdx: g[0].start_index, endIdx: g[g.length - 1].end_index,
+                       startKm: startDist[ivs.indexOf(g[0])] / 1000 };
+            }).filter(c => c.dist >= min_km * 1000);
+
+            let st = null, gv = null;
+            const loadStreams = async () => {
+              if (st) return st;
+              try {
+                st = await fetchStreams(a.id, "time,heartrate,velocity_smooth,distance,altitude");
+                gv = gapVelocity(st.vel, st.dist, st.alt);
+              } catch (_) { st = null; }
+              return st;
+            };
+
+            if (cands.length) {
+              await loadStreams();
+              for (const c of cands) {
+                const n = st ? Math.min(st.vel.length, st.dist.length) : 0;
+                const hasIdx = st && c.startIdx != null && c.endIdx != null && c.endIdx < n && c.endIdx > c.startIdx;
+                const m = hasIdx ? enrich(st, gv, c.startIdx, c.endIdx) : null;
+                if (m) {
+                  // Distancia y ritmo exactos del intervalo; GAP, FC sin retardo y desacoplamiento de los streams
+                  pushSeg(a, { ...m, km: c.dist / 1000, v: c.dist / c.secs, hr: m.hr ?? c.hr }, "int");
+                } else {
+                  pushSeg(a, { startKm: c.startKm, km: c.dist / 1000, v: c.dist / c.secs, vg: c.dist / c.secs, hr: c.hr, up: 0, dec: null }, "int");
+                }
+              }
+              return;
+            }
+
+            // ── 2) Respaldo: detección sobre los streams (carreras sin vueltas útiles) ──
+            if (!await loadStreams()) return;
+            const n = Math.min(st.vel.length, st.dist.length);
+            if (n < 300 || !st.hr.length) return;
             const rv = new Array(n); let acc = 0;
             for (let k = 0; k < n; k++) { acc += gv[k] || 0; if (k >= 60) acc -= gv[k - 60] || 0; rv[k] = acc / Math.min(k + 1, 60); }
-            const inBand = (k) => rv[k] >= vLo && rv[k] <= vHi;
             let k = 0;
             while (k < n) {
-              if (!inBand(k)) { k++; continue; }
+              if (!inBandSp(rv[k])) { k++; continue; }
               let start = k, last = k, gap = 0; k++;
-              while (k < n) {
-                if (inBand(k)) { last = k; gap = 0; } else if (++gap > 45) break; // tolera 45 s fuera de banda
-                k++;
-              }
-              const segM = (dist[last] || 0) - (dist[start] || 0);
-              if (segM < min_km * 1000) continue;
-              const tOf = (x) => time.length ? time[x] : x;
-              const secs = tOf(last) - tOf(start);
-              if (secs <= 0) continue;
-              // FC: se descartan los primeros 90 s del tramo (retardo cardíaco)
-              const hrFrom = secs > 300 ? start + Math.min(90, Math.floor((last - start) / 4)) : start;
-              const hrVals = []; for (let x = hrFrom; x <= last; x++) if (hr[x] > 60) hrVals.push(hr[x]);
-              if (hrVals.length < 60) continue;
-              const v = segM / secs, h = mean(hrVals);
-              const gVals = []; for (let x = start; x <= last; x++) gVals.push(gv[x]);
-              const vg = mean(gVals) || v; // velocidad media ajustada a pendiente
-              let up = 0;
-              if (alt.length) { for (let x = start + 10; x <= last; x += 10) { const dz = (alt[x] || 0) - (alt[x - 10] || 0); if (dz > 0) up += dz; } }
-              // Desacoplamiento con velocidad ajustada a pendiente (las cuestas no lo distorsionan)
-              const dec = secs >= 1200 ? computeDecoupling({ ...r.st, vel: gv }, dist[start], dist[last]) : null;
-              segs.push({
-                date: (r.a.start_date_local || "").split("T")[0], name: r.a.name || "",
-                startKm: (dist[start] || 0) / 1000, km: segM / 1000, pace: 1000 / v, gap: 1000 / vg, hr: h,
-                hrNorm: h * (vT / vg), // FC normalizada con el ritmo ajustado a pendiente (aprox. proporcional)
-                dec: dec ? dec.decoupling : null, up,
-              });
+              while (k < n) { if (inBandSp(rv[k])) { last = k; gap = 0; } else if (++gap > 45) break; k++; }
+              if ((st.dist[last] || 0) - (st.dist[start] || 0) < min_km * 1000) continue;
+              pushSeg(a, enrich(st, gv, start, last), "gps");
             }
-          }
+          }));
         }
+        segs.sort((x, y) => x.date.localeCompare(y.date) || x.startKm - y.startKm);
         if (!segs.length) return { content: [{ type: "text", text: `No hay tramos de ≥${min_km} km entre ${pace_fast} y ${pace_slow}/km en los últimos ${nDays} días.` }] };
 
         const L = [`🎯 COSTE CARDÍACO DEL RITMO MARATÓN — banda ${pace_fast}-${pace_slow}/km · normalizado a ${target_pace}`,
@@ -1826,9 +1878,10 @@ function createServer() {
                    `fecha      | inicio | tramo  | ritmo | GAP  | FC  | FC@${target_pace} | desac | desn+`];
         segs.slice(-25).forEach(s => {
           const fat = s.startKm >= 15 ? "🔋" : "  ";
-          L.push(`${s.date} | ${fat}${s.startKm.toFixed(1).padStart(4)} | ${s.km.toFixed(1).padStart(4)}km | ${fmtSecs(s.pace)} | ${fmtSecs(s.gap)} | ${Math.round(s.hr)} | ${Math.round(s.hrNorm).toString().padStart(3)}     | ${s.dec != null ? fmt1(s.dec).padStart(4) + "%" : "   - "} | ${Math.round(s.up)}m`);
+          const srcMark = s.src === "gps" ? "*" : " ";
+          L.push(`${s.date}${srcMark}| ${fat}${s.startKm.toFixed(1).padStart(4)} | ${s.km.toFixed(1).padStart(4)}km | ${fmtSecs(s.pace)} | ${fmtSecs(s.gap)} | ${Math.round(s.hr)} | ${Math.round(s.hrNorm).toString().padStart(3)}     | ${s.dec != null ? fmt1(s.dec).padStart(4) + "%" : "   - "} | ${Math.round(s.up)}m`);
         });
-        L.push(`   🔋 = tramo iniciado a partir del km 15 (con fatiga acumulada)`);
+        L.push(`   🔋 = tramo iniciado a partir del km 15 (con fatiga acumulada) · * = detectado por GPS (sin vueltas), menos preciso`);
 
         // Tendencia: regresión ponderada por km de la FC normalizada frente al tiempo
         const t0 = new Date(`${segs[0].date}T12:00:00Z`).getTime();
@@ -2121,9 +2174,9 @@ app.delete(MCP_PATHS, requireAuth, async (req, res) => {
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/health", (_, res) => res.json({
-  status: "ok", version: "6.2.0", transport: "streamable-http", sessions: sessions.size, auth: !!AUTH_TOKEN
+  status: "ok", version: "6.3.0", transport: "streamable-http", sessions: sessions.size, auth: !!AUTH_TOKEN
 }));
 
 app.listen(PORT, () => {
-  console.log(`✅ Intervals MCP v6.2 (Streamable HTTP) — port ${PORT} — athlete ${ATHLETE_ID} — ${AUTH_TOKEN ? "🔒 token activo" : "⚠️ SIN token: endpoint abierto"}`);
+  console.log(`✅ Intervals MCP v6.3 (Streamable HTTP) — port ${PORT} — athlete ${ATHLETE_ID} — ${AUTH_TOKEN ? "🔒 token activo" : "⚠️ SIN token: endpoint abierto"}`);
 });
