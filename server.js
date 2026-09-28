@@ -147,14 +147,25 @@ async function fetchStreams(activity_id, types = "time,heartrate,velocity_smooth
 
 // ─── Zonas de FC dinámicas (leídas de intervals, no fijas en el código) ──────
 const DEFAULT_HR_UPPER = [133, 148, 163, 178, 193];
-const RUN_TYPES = ["run","walk","hike","trail","track","treadmill","virtualrun"];
+// Elige la configuración de CORRER: prioridad al tipo exacto "Run", después cualquier tipo "*Run".
+// Nunca "Otro" (Walk/Hike…), que tiene zonas por defecto distintas.
+function pickRunConfig(configs) {
+  const score = (c) => {
+    const t = (c.types || []).map(x => String(x).toLowerCase());
+    if (t.includes("run")) return 3;
+    if (t.some(x => x.endsWith("run"))) return 2;
+    return 0;
+  };
+  const best = [...configs].sort((a, b) => score(b) - score(a))[0];
+  return best && score(best) > 0 ? best : null;
+}
 let zoneCache = { at: 0, upper: null, cfg: null };
 
 async function getRunConfig(force = false) {
   if (!force && zoneCache.cfg && Date.now() - zoneCache.at < 10 * 60 * 1000) return zoneCache.cfg;
   const data = await callIntervals(`/athlete/${ATHLETE_ID}/sport-settings`);
   const configs = Array.isArray(data) ? data : [data];
-  const cfg = configs.find(c => (c.types || []).some(t => RUN_TYPES.some(r => String(t).toLowerCase().includes(r)))) || configs[0] || null;
+  const cfg = pickRunConfig(configs);
   zoneCache = { at: Date.now(), cfg, upper: null };
   return cfg;
 }
@@ -245,7 +256,7 @@ function bestEffort(time, rawDist, targetM) {
 
 // ─── MCP Server factory ───────────────────────────────────────────────────────
 function createServer() {
-  const srv = new McpServer({ name: "intervals-mcp", version: "5.1.0" });
+  const srv = new McpServer({ name: "intervals-mcp", version: "5.2.0" });
 
   srv.tool("get_athlete_profile",
     "Get full athlete profile: demographics, weight, HR zones, pace zones, FTP, VO2max, thresholds. Dumps all available fields.",
@@ -1075,10 +1086,7 @@ function createServer() {
         const configs = Array.isArray(data) ? data : [data];
 
         // Find running config
-        const RUN_TYPES = ["run","walk","hike","trail","track","treadmill","virtualrun"];
-        const runCfg = configs.find(c =>
-          (c.types || []).some(t => RUN_TYPES.some(r => t.toLowerCase().includes(r)))
-        );
+        const runCfg = pickRunConfig(configs);
 
         const lines = [`⚙️ CONFIGURACIÓN RUNNING\n`];
 
@@ -1193,8 +1201,7 @@ function createServer() {
       try {
         const data    = await callIntervals(`/athlete/${ATHLETE_ID}/sport-settings`);
         const configs = Array.isArray(data) ? data : [data];
-        const RUN_TYPES = ["run","walk","hike","trail","track","treadmill","virtualrun"];
-        const runCfg  = configs.find(c => (c.types||[]).some(t => RUN_TYPES.some(r => t.toLowerCase().includes(r))));
+        const runCfg  = pickRunConfig(configs);
         const cfg     = runCfg || configs[0];
 
         const cs    = cfg?.threshold_pace;
@@ -1771,6 +1778,14 @@ app.post(MCP_PATHS, requireAuth, async (req, res) => {
     const sessionId = req.headers["mcp-session-id"];
     let transport = getOrCreateTransport(sessionId);
 
+    // Sesión de antes de un redespliegue: según la especificación MCP se responde 404
+    // para que el cliente (Claude) abra una sesión nueva automáticamente.
+    if (!transport && sessionId) {
+      console.log(`Sesión desconocida (probable redespliegue): ${sessionId}`);
+      res.status(404).json({ jsonrpc: "2.0", error: { code: -32001, message: "Session not found" }, id: req.body?.id ?? null });
+      return;
+    }
+
     if (!transport) {
       // New session
       transport = new StreamableHTTPServerTransport({
@@ -1808,7 +1823,7 @@ app.get(MCP_PATHS, requireAuth, async (req, res) => {
     const sessionId = req.headers["mcp-session-id"];
     const transport = getOrCreateTransport(sessionId);
     if (!transport) {
-      res.status(400).json({ error: "No active session. Send POST /sse first." });
+      res.status(sessionId ? 404 : 400).json({ error: sessionId ? "Session not found" : "No active session. Send POST /sse first." });
       return;
     }
     await transport.handleRequest(req, res);
@@ -1832,9 +1847,9 @@ app.delete(MCP_PATHS, requireAuth, async (req, res) => {
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/health", (_, res) => res.json({
-  status: "ok", version: "5.1.0", transport: "streamable-http", sessions: sessions.size, auth: !!AUTH_TOKEN
+  status: "ok", version: "5.2.0", transport: "streamable-http", sessions: sessions.size, auth: !!AUTH_TOKEN
 }));
 
 app.listen(PORT, () => {
-  console.log(`✅ Intervals MCP v5.1 (Streamable HTTP) — port ${PORT} — athlete ${ATHLETE_ID} — ${AUTH_TOKEN ? "🔒 token activo" : "⚠️ SIN token: endpoint abierto"}`);
+  console.log(`✅ Intervals MCP v5.2 (Streamable HTTP) — port ${PORT} — athlete ${ATHLETE_ID} — ${AUTH_TOKEN ? "🔒 token activo" : "⚠️ SIN token: endpoint abierto"}`);
 });

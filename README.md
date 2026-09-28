@@ -39,6 +39,11 @@ Si `MCP_AUTH_TOKEN` está definido, `/sse` sin token devuelve 401. También se a
 
 ---
 
+## Novedades v5.2.0
+
+- Selección de la configuración de running: prioridad al tipo exacto `Run`. Antes podía coger la configuración "Otro" (Walk/Hike), con zonas por defecto distintas, y mostrar etiquetas de zona erróneas — y `update_sport_settings` habría escrito en la configuración equivocada
+- Sesiones caducadas tras un redespliegue → HTTP 404 según la especificación MCP, para que el cliente reconecte solo en lugar de fallar
+
 ## Novedades v5.1.0 (tras pruebas con la API real)
 
 - `create_events_bulk`: intervals devuelve los eventos ordenados por fecha → ahora se emparejan por fecha + nombre (antes la corrección de duración de fuerza podía caer en otro evento)
