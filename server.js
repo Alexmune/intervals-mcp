@@ -228,6 +228,24 @@ function computeDecoupling(st, fromM = null, toM = null) {
   };
 }
 
+// ─── Velocidad ajustada por pendiente (GAP aproximado) ───────────────────────
+// Pendiente sobre ~30 s; subida: +3.3 % de coste por 1 % de pendiente; bajada: −1.8 % por 1 % (acotado).
+function gapVelocity(vel, dist, alt) {
+  const n = vel.length, out = new Array(n);
+  for (let k = 0; k < n; k++) {
+    let f = 1;
+    if (alt.length && dist.length && k >= 30) {
+      const dd = (dist[k] || 0) - (dist[k - 30] || 0);
+      if (dd > 30) {
+        const g = Math.max(-15, Math.min(15, ((alt[k] || 0) - (alt[k - 30] || 0)) / dd * 100));
+        f = g >= 0 ? 1 + 0.033 * g : 1 + 0.018 * g;
+      }
+    }
+    out[k] = (vel[k] || 0) * f;
+  }
+  return out;
+}
+
 // ─── Mejor esfuerzo en una distancia (dos punteros sobre distancia/tiempo) ───
 // Limpia saltos de GPS: incrementos negativos o > 8 m/s se descartan (conservador)
 function cleanDistance(time, dist) {
@@ -256,7 +274,7 @@ function bestEffort(time, rawDist, targetM) {
 
 // ─── MCP Server factory ───────────────────────────────────────────────────────
 function createServer() {
-  const srv = new McpServer({ name: "intervals-mcp", version: "6.0.0" });
+  const srv = new McpServer({ name: "intervals-mcp", version: "6.2.0" });
 
   srv.tool("get_athlete_profile",
     "Get full athlete profile: demographics, weight, HR zones, pace zones, FTP, VO2max, thresholds. Dumps all available fields.",
@@ -1732,21 +1750,21 @@ function createServer() {
   // ═══════════════════════════════════════════════════════════════════════════
 
   srv.tool("get_mp_trend",
-    "Marathon-pace readiness indicator: finds every continuous segment run inside a pace band (default 4:10-4:22/km) over the last N days and reports, per segment, pace, HR, HR normalised to the target pace, decoupling, elevation and the km where it started (fatigue context). Returns the trend of the HR cost of marathon pace. Slow (10-30 s): use in Sunday reviews, not daily.",
+    "Marathon-pace readiness indicator: finds every continuous segment run inside a grade-adjusted pace band (default 4:05-4:25/km) over the last N days and reports, per segment, pace, HR, HR normalised to the target pace, decoupling, elevation and the km where it started (fatigue context). Returns the trend of the HR cost of marathon pace. Slow (10-30 s): use in Sunday reviews, not daily.",
     {
       target_pace:   z.string().optional().describe("Ritmo objetivo m:ss/km para normalizar la FC (default: 4:16)"),
-      pace_fast:     z.string().optional().describe("Límite rápido de la banda m:ss/km (default: 4:10)"),
-      pace_slow:     z.string().optional().describe("Límite lento de la banda m:ss/km (default: 4:22)"),
+      pace_fast:     z.string().optional().describe("Límite rápido de la banda m:ss/km, en ritmo ajustado a pendiente (default: 4:05)"),
+      pace_slow:     z.string().optional().describe("Límite lento de la banda m:ss/km, en ritmo ajustado a pendiente (default: 4:25)"),
       days:          z.number().optional().describe("Días hacia atrás (default: 90, máx: 180)"),
       min_km:        z.number().optional().describe("Longitud mínima del tramo en km (default: 2)"),
       include_treadmill: z.boolean().optional().describe("Incluir cinta/VirtualRun (default: false)"),
     },
-    async ({ target_pace = "4:16", pace_fast = "4:10", pace_slow = "4:22", days = 90, min_km = 2, include_treadmill = false }) => {
+    async ({ target_pace = "4:16", pace_fast = "4:05", pace_slow = "4:25", days = 90, min_km = 2, include_treadmill = false }) => {
       try {
         const vT = paceStrToMps(target_pace), vF = paceStrToMps(pace_fast), vS = paceStrToMps(pace_slow);
         if (!vT || !vF || !vS || vF <= vS) return { content: [{ type: "text", text: "❌ Ritmos no válidos (formato m:ss, pace_fast más rápido que pace_slow)." }] };
-        // Tolerancia de 2 s/km en los bordes de la banda
-        const vHi = 1000 / (1000 / vF - 2), vLo = 1000 / (1000 / vS + 2);
+        // Tolerancia de 4 s/km en los bordes de la banda
+        const vHi = 1000 / (1000 / vF - 4), vLo = 1000 / (1000 / vS + 4);
         const nDays = Math.min(days, 180);
         const params = new URLSearchParams({ oldest: daysAgo(nDays), newest: today() });
         const acts = toArray(await callIntervals(`/athlete/${ATHLETE_ID}/activities?${params}`), "activities")
@@ -1763,16 +1781,17 @@ function createServer() {
             const { time, hr, vel, dist, alt } = r.st;
             const n = Math.min(vel.length, dist.length);
             if (n < 300 || !hr.length) continue;
-            // Media móvil de 30 s de la velocidad
+            // Media móvil de 60 s de la velocidad AJUSTADA A PENDIENTE (las cuestas no rompen el tramo)
+            const gv = gapVelocity(vel.slice(0, n), dist, alt);
             const rv = new Array(n); let acc = 0;
-            for (let k = 0; k < n; k++) { acc += vel[k] || 0; if (k >= 30) acc -= vel[k - 30] || 0; rv[k] = acc / Math.min(k + 1, 30); }
+            for (let k = 0; k < n; k++) { acc += gv[k] || 0; if (k >= 60) acc -= gv[k - 60] || 0; rv[k] = acc / Math.min(k + 1, 60); }
             const inBand = (k) => rv[k] >= vLo && rv[k] <= vHi;
             let k = 0;
             while (k < n) {
               if (!inBand(k)) { k++; continue; }
               let start = k, last = k, gap = 0; k++;
               while (k < n) {
-                if (inBand(k)) { last = k; gap = 0; } else if (++gap > 20) break; // tolera 20 s fuera de banda
+                if (inBand(k)) { last = k; gap = 0; } else if (++gap > 45) break; // tolera 45 s fuera de banda
                 k++;
               }
               const segM = (dist[last] || 0) - (dist[start] || 0);
@@ -1785,13 +1804,16 @@ function createServer() {
               const hrVals = []; for (let x = hrFrom; x <= last; x++) if (hr[x] > 60) hrVals.push(hr[x]);
               if (hrVals.length < 60) continue;
               const v = segM / secs, h = mean(hrVals);
+              const gVals = []; for (let x = start; x <= last; x++) gVals.push(gv[x]);
+              const vg = mean(gVals) || v; // velocidad media ajustada a pendiente
               let up = 0;
               if (alt.length) { for (let x = start + 10; x <= last; x += 10) { const dz = (alt[x] || 0) - (alt[x - 10] || 0); if (dz > 0) up += dz; } }
-              const dec = secs >= 1200 ? computeDecoupling(r.st, dist[start], dist[last]) : null;
+              // Desacoplamiento con velocidad ajustada a pendiente (las cuestas no lo distorsionan)
+              const dec = secs >= 1200 ? computeDecoupling({ ...r.st, vel: gv }, dist[start], dist[last]) : null;
               segs.push({
                 date: (r.a.start_date_local || "").split("T")[0], name: r.a.name || "",
-                startKm: (dist[start] || 0) / 1000, km: segM / 1000, pace: 1000 / v, hr: h,
-                hrNorm: h * (vT / v), // aproximación proporcional, válida dentro de la banda estrecha
+                startKm: (dist[start] || 0) / 1000, km: segM / 1000, pace: 1000 / v, gap: 1000 / vg, hr: h,
+                hrNorm: h * (vT / vg), // FC normalizada con el ritmo ajustado a pendiente (aprox. proporcional)
                 dec: dec ? dec.decoupling : null, up,
               });
             }
@@ -1801,10 +1823,10 @@ function createServer() {
 
         const L = [`🎯 COSTE CARDÍACO DEL RITMO MARATÓN — banda ${pace_fast}-${pace_slow}/km · normalizado a ${target_pace}`,
                    `   ${segs.length} tramos en ${new Set(segs.map(s => s.date)).size} sesiones (últimos ${nDays} días)`, ``,
-                   `fecha      | inicio | tramo  | ritmo | FC  | FC@${target_pace} | desac | desn+`];
+                   `fecha      | inicio | tramo  | ritmo | GAP  | FC  | FC@${target_pace} | desac | desn+`];
         segs.slice(-25).forEach(s => {
           const fat = s.startKm >= 15 ? "🔋" : "  ";
-          L.push(`${s.date} | ${fat}${s.startKm.toFixed(1).padStart(4)} | ${s.km.toFixed(1).padStart(4)}km | ${fmtSecs(s.pace)} | ${Math.round(s.hr)} | ${Math.round(s.hrNorm).toString().padStart(3)}     | ${s.dec != null ? fmt1(s.dec).padStart(4) + "%" : "   - "} | ${Math.round(s.up)}m`);
+          L.push(`${s.date} | ${fat}${s.startKm.toFixed(1).padStart(4)} | ${s.km.toFixed(1).padStart(4)}km | ${fmtSecs(s.pace)} | ${fmtSecs(s.gap)} | ${Math.round(s.hr)} | ${Math.round(s.hrNorm).toString().padStart(3)}     | ${s.dec != null ? fmt1(s.dec).padStart(4) + "%" : "   - "} | ${Math.round(s.up)}m`);
         });
         L.push(`   🔋 = tramo iniciado a partir del km 15 (con fatiga acumulada)`);
 
@@ -1822,13 +1844,19 @@ function createServer() {
         const fresh = recent.filter(s => s.startKm < 15), tired = recent.filter(s => s.startKm >= 15);
         const decs = recent.filter(s => s.dec != null).map(s => s.dec);
 
+        const nSessions = new Set(segs.map(s => s.date)).size;
+        const span = xs[xs.length - 1] - xs[0];
         L.push(``, `📉 TENDENCIA`);
-        L.push(`   FC a ${target_pace}: ${slope <= 0 ? "▼" : "▲"} ${Math.abs(slope * 28).toFixed(1)} bpm cada 4 semanas ${slope < -0.5 / 28 ? "🟢 (mejorando)" : slope > 0.5 / 28 ? "🔴 (empeorando)" : "🟡 (estable)"}`);
+        if (nSessions >= 3 && span >= 21) {
+          L.push(`   FC a ${target_pace}: ${slope <= 0 ? "▼" : "▲"} ${Math.abs(slope * 28).toFixed(1)} bpm cada 4 semanas ${slope < -0.5 / 28 ? "🟢 (mejorando)" : slope > 0.5 / 28 ? "🔴 (empeorando)" : "🟡 (estable)"}`);
+        } else {
+          L.push(`   ⚠️ Datos insuficientes para una tendencia fiable (${nSessions} sesiones en ${Math.round(span)} días; mínimo 3 sesiones en 21 días)`);
+        }
         if (older.length && recent.length) L.push(`   Últimas 4 semanas: ${Math.round(wavg(recent))} bpm · antes: ${Math.round(wavg(older))} bpm`);
-        if (fresh.length && tired.length) L.push(`   Últimas 4 semanas — fresco: ${Math.round(wavg(fresh))} bpm · con fatiga (km 15+): ${Math.round(wavg(tired))} bpm (+${Math.round(wavg(tired) - wavg(fresh))})`);
+        if (fresh.length && tired.length) L.push(`   Últimas 4 semanas — fresco: ${Math.round(wavg(fresh))} bpm · con fatiga (km 15+): ${Math.round(wavg(tired))} bpm (${wavg(tired) >= wavg(fresh) ? "+" : ""}${Math.round(wavg(tired) - wavg(fresh))})`);
         if (decs.length) L.push(`   Desacoplamiento medio (tramos ≥20 min, últimas 4 semanas): ${fmt1(mean(decs))}%`);
         L.push(`   Km a ritmo maratón últimas 4 semanas: ${recent.reduce((a, s) => a + s.km, 0).toFixed(1)} km · tramo más largo: ${Math.max(...recent.map(s => s.km), 0).toFixed(1)} km`);
-        L.push(``, `ℹ️ FC@objetivo es una aproximación (FC × velocidad objetivo / velocidad real). Contrastar siempre con calor, desnivel y sueño del día.`);
+        L.push(``, `ℹ️ Tramos detectados por ritmo ajustado a pendiente (GAP aprox.). FC@objetivo = FC × velocidad objetivo / velocidad GAP. Contrastar siempre con calor y sueño del día.`);
         return { content: [{ type: "text", text: L.join("\n") }] };
       } catch (err) {
         return { content: [{ type: "text", text: `❌ get_mp_trend: ${err.message}` }] };
@@ -1855,7 +1883,7 @@ function createServer() {
         const [wData, aData, eData] = await Promise.all([
           callIntervals(`/athlete/${ATHLETE_ID}/wellness?${new URLSearchParams({ oldest: addDays(d, -3), newest: d })}`),
           callIntervals(`/athlete/${ATHLETE_ID}/activities?${new URLSearchParams({ oldest: histStart, newest: d })}`),
-          callIntervals(`/athlete/${ATHLETE_ID}/events?${new URLSearchParams({ oldest: d, newest: until })}`),
+          callIntervals(`/athlete/${ATHLETE_ID}/events?${new URLSearchParams({ oldest: histStart, newest: until })}`),
         ]);
 
         // Punto de partida: CTL/ATL al final de ayer
@@ -1895,13 +1923,28 @@ function createServer() {
         }
         const avg4 = mean(weeks.slice(-4).map(w => w.ld));
 
-        // Entrenos planificados
+        // Calibración: intervals calcula la carga de los entrenos PLANIFICADOS con otro modelo (por ritmo)
+        // que puede diferir mucho de la carga real (por FC). Factor = real / planificado en semanas pasadas.
+        const allEvents = toArray(eData, "events").filter(e => !e.category || e.category === "WORKOUT");
+        let pastPlanned = 0, pastActual = 0;
+        weeks.forEach(w => {
+          let pl = 0;
+          allEvents.forEach(e => {
+            const day = (e.start_date_local || "").split("T")[0];
+            if (day >= w.mon && day <= addDays(w.mon, 6)) pl += firstDefined(e.icu_training_load, e.load) || 0;
+          });
+          if (pl > 0 && w.ld > 0) { pastPlanned += pl; pastActual += w.ld; }
+        });
+        const calib = pastPlanned > 0 ? Math.max(0.4, Math.min(1.5, pastActual / pastPlanned)) : 1;
+
+        // Entrenos planificados (futuros)
         const planned = {}; let lastPlanned = null, estimated = 0;
-        toArray(eData, "events").forEach(e => {
-          if (e.category && e.category !== "WORKOUT") return;
+        allEvents.forEach(e => {
           const day = (e.start_date_local || "").split("T")[0];
+          if (day < d) return;
           let ld = firstDefined(e.icu_training_load, e.load);
-          if (ld == null && e.moving_time) { ld = e.moving_time / 3600 * lph(e.type); estimated++; }
+          if (ld != null) ld *= calib;
+          else if (e.moving_time) { ld = e.moving_time / 3600 * lph(e.type); estimated++; }
           if (ld == null) return;
           planned[day] = (planned[day] || 0) + ld;
           if (!lastPlanned || day > lastPlanned) lastPlanned = day;
@@ -1937,6 +1980,9 @@ function createServer() {
         const L = [`🔮 PROYECCIÓN DE CARGA hasta ${until}`, `   Punto de partida (${base.id}): CTL ${fmt1(base.ctl)} · ATL ${fmt1(base.atl)}`, ``, `📚 CARGA REAL — últimas 8 semanas`];
         weeks.forEach(w => L.push(`   sem ${w.mon}: ${fmt0(w.ld)} TSS · ${w.km.toFixed(0)} km`));
         L.push(`   Media últimas 4 semanas: ${fmt0(avg4)} TSS/semana · carrera ≈ ${fmt0(lph("Run"))} TSS/h`);
+        const kmTot = weeks.reduce((a, w) => a + w.km, 0), ldTot = weeks.reduce((a, w) => a + w.ld, 0);
+        if (kmTot > 0) L.push(`   Conversión real: ${(ldTot / kmTot).toFixed(1)} TSS por km (útil para traducir km planificados a carga)`);
+        L.push(`   Calibración carga planificada → real: ×${calib.toFixed(2)}${pastPlanned > 0 ? "" : " (sin histórico de planificados)"}`);
         L.push(``, `📅 PROYECCIÓN SEMANAL (fin de semana, domingo)`, `   semana      | carga | CTL  | ATL  | TSB   | origen`);
         weekRows.forEach(r => L.push(`   ${r.end} | ${fmt0(r.ld).padStart(5)} | ${fmt1(r.ctl).padStart(4)} | ${fmt1(r.atl).padStart(4)} | ${fmt1(r.ctl - r.atl).padStart(5)} | ${r.src}`));
         const peak = weekRows.reduce((m, r) => r.ctl > m.ctl ? r : m, weekRows[0]);
@@ -2075,9 +2121,9 @@ app.delete(MCP_PATHS, requireAuth, async (req, res) => {
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/health", (_, res) => res.json({
-  status: "ok", version: "6.0.0", transport: "streamable-http", sessions: sessions.size, auth: !!AUTH_TOKEN
+  status: "ok", version: "6.2.0", transport: "streamable-http", sessions: sessions.size, auth: !!AUTH_TOKEN
 }));
 
 app.listen(PORT, () => {
-  console.log(`✅ Intervals MCP v6 (Streamable HTTP) — port ${PORT} — athlete ${ATHLETE_ID} — ${AUTH_TOKEN ? "🔒 token activo" : "⚠️ SIN token: endpoint abierto"}`);
+  console.log(`✅ Intervals MCP v6.2 (Streamable HTTP) — port ${PORT} — athlete ${ATHLETE_ID} — ${AUTH_TOKEN ? "🔒 token activo" : "⚠️ SIN token: endpoint abierto"}`);
 });

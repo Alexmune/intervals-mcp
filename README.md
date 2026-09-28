@@ -39,6 +39,14 @@ Si `MCP_AUTH_TOKEN` está definido, `/sse` sin token devuelve 401. También se a
 
 ---
 
+## Novedades v6.2.0
+
+- `project_fitness`: calibración automática de la carga planificada. intervals calcula la carga de los entrenos planificados con un modelo por ritmo que puede diferir mucho de la real (por FC); ahora se escala con el factor real/planificado de las últimas 8 semanas. Muestra también la conversión real TSS/km
+
+## Novedades v6.1.0
+
+- `get_mp_trend`: detección por ritmo ajustado a pendiente (GAP aproximado), media móvil de 60 s, banda por defecto 4:05-4:25/km y tolerancia de 45 s fuera de banda → los tramos con cuestas ya no se cortan. Desacoplamiento calculado también con GAP. La tendencia solo se calcula con ≥3 sesiones en ≥21 días
+
 ## Novedades v6.0.0
 
 **Herramientas nuevas (2) → 29 en total:**
