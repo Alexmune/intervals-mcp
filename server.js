@@ -256,7 +256,7 @@ function bestEffort(time, rawDist, targetM) {
 
 // ─── MCP Server factory ───────────────────────────────────────────────────────
 function createServer() {
-  const srv = new McpServer({ name: "intervals-mcp", version: "5.2.0" });
+  const srv = new McpServer({ name: "intervals-mcp", version: "6.0.0" });
 
   srv.tool("get_athlete_profile",
     "Get full athlete profile: demographics, weight, HR zones, pace zones, FTP, VO2max, thresholds. Dumps all available fields.",
@@ -1727,6 +1727,234 @@ function createServer() {
     }
   );
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // v6 — INDICADOR DE RITMO MARATÓN + PROYECCIÓN DE CARGA
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  srv.tool("get_mp_trend",
+    "Marathon-pace readiness indicator: finds every continuous segment run inside a pace band (default 4:10-4:22/km) over the last N days and reports, per segment, pace, HR, HR normalised to the target pace, decoupling, elevation and the km where it started (fatigue context). Returns the trend of the HR cost of marathon pace. Slow (10-30 s): use in Sunday reviews, not daily.",
+    {
+      target_pace:   z.string().optional().describe("Ritmo objetivo m:ss/km para normalizar la FC (default: 4:16)"),
+      pace_fast:     z.string().optional().describe("Límite rápido de la banda m:ss/km (default: 4:10)"),
+      pace_slow:     z.string().optional().describe("Límite lento de la banda m:ss/km (default: 4:22)"),
+      days:          z.number().optional().describe("Días hacia atrás (default: 90, máx: 180)"),
+      min_km:        z.number().optional().describe("Longitud mínima del tramo en km (default: 2)"),
+      include_treadmill: z.boolean().optional().describe("Incluir cinta/VirtualRun (default: false)"),
+    },
+    async ({ target_pace = "4:16", pace_fast = "4:10", pace_slow = "4:22", days = 90, min_km = 2, include_treadmill = false }) => {
+      try {
+        const vT = paceStrToMps(target_pace), vF = paceStrToMps(pace_fast), vS = paceStrToMps(pace_slow);
+        if (!vT || !vF || !vS || vF <= vS) return { content: [{ type: "text", text: "❌ Ritmos no válidos (formato m:ss, pace_fast más rápido que pace_slow)." }] };
+        // Tolerancia de 2 s/km en los bordes de la banda
+        const vHi = 1000 / (1000 / vF - 2), vLo = 1000 / (1000 / vS + 2);
+        const nDays = Math.min(days, 180);
+        const params = new URLSearchParams({ oldest: daysAgo(nDays), newest: today() });
+        const acts = toArray(await callIntervals(`/athlete/${ATHLETE_ID}/activities?${params}`), "activities")
+          .filter(a => (a.type === "Run" || (include_treadmill && a.type === "VirtualRun")) && (a.distance || 0) >= min_km * 1000 && !(a.trainer && !include_treadmill))
+          .filter(a => { const sp = a.average_speed || 0; return sp === 0 || sp > vLo * 0.75; }) // descarta rodajes muy lentos sin opción de tramo
+          .sort((a, b) => String(a.start_date_local).localeCompare(String(b.start_date_local)));
+
+        const segs = [];
+        for (let i = 0; i < acts.length; i += 5) {
+          const batch = acts.slice(i, i + 5);
+          const res = await Promise.all(batch.map(a => fetchStreams(a.id, "time,heartrate,velocity_smooth,distance,altitude").then(st => ({ a, st })).catch(() => null)));
+          for (const r of res) {
+            if (!r) continue;
+            const { time, hr, vel, dist, alt } = r.st;
+            const n = Math.min(vel.length, dist.length);
+            if (n < 300 || !hr.length) continue;
+            // Media móvil de 30 s de la velocidad
+            const rv = new Array(n); let acc = 0;
+            for (let k = 0; k < n; k++) { acc += vel[k] || 0; if (k >= 30) acc -= vel[k - 30] || 0; rv[k] = acc / Math.min(k + 1, 30); }
+            const inBand = (k) => rv[k] >= vLo && rv[k] <= vHi;
+            let k = 0;
+            while (k < n) {
+              if (!inBand(k)) { k++; continue; }
+              let start = k, last = k, gap = 0; k++;
+              while (k < n) {
+                if (inBand(k)) { last = k; gap = 0; } else if (++gap > 20) break; // tolera 20 s fuera de banda
+                k++;
+              }
+              const segM = (dist[last] || 0) - (dist[start] || 0);
+              if (segM < min_km * 1000) continue;
+              const tOf = (x) => time.length ? time[x] : x;
+              const secs = tOf(last) - tOf(start);
+              if (secs <= 0) continue;
+              // FC: se descartan los primeros 90 s del tramo (retardo cardíaco)
+              const hrFrom = secs > 300 ? start + Math.min(90, Math.floor((last - start) / 4)) : start;
+              const hrVals = []; for (let x = hrFrom; x <= last; x++) if (hr[x] > 60) hrVals.push(hr[x]);
+              if (hrVals.length < 60) continue;
+              const v = segM / secs, h = mean(hrVals);
+              let up = 0;
+              if (alt.length) { for (let x = start + 10; x <= last; x += 10) { const dz = (alt[x] || 0) - (alt[x - 10] || 0); if (dz > 0) up += dz; } }
+              const dec = secs >= 1200 ? computeDecoupling(r.st, dist[start], dist[last]) : null;
+              segs.push({
+                date: (r.a.start_date_local || "").split("T")[0], name: r.a.name || "",
+                startKm: (dist[start] || 0) / 1000, km: segM / 1000, pace: 1000 / v, hr: h,
+                hrNorm: h * (vT / v), // aproximación proporcional, válida dentro de la banda estrecha
+                dec: dec ? dec.decoupling : null, up,
+              });
+            }
+          }
+        }
+        if (!segs.length) return { content: [{ type: "text", text: `No hay tramos de ≥${min_km} km entre ${pace_fast} y ${pace_slow}/km en los últimos ${nDays} días.` }] };
+
+        const L = [`🎯 COSTE CARDÍACO DEL RITMO MARATÓN — banda ${pace_fast}-${pace_slow}/km · normalizado a ${target_pace}`,
+                   `   ${segs.length} tramos en ${new Set(segs.map(s => s.date)).size} sesiones (últimos ${nDays} días)`, ``,
+                   `fecha      | inicio | tramo  | ritmo | FC  | FC@${target_pace} | desac | desn+`];
+        segs.slice(-25).forEach(s => {
+          const fat = s.startKm >= 15 ? "🔋" : "  ";
+          L.push(`${s.date} | ${fat}${s.startKm.toFixed(1).padStart(4)} | ${s.km.toFixed(1).padStart(4)}km | ${fmtSecs(s.pace)} | ${Math.round(s.hr)} | ${Math.round(s.hrNorm).toString().padStart(3)}     | ${s.dec != null ? fmt1(s.dec).padStart(4) + "%" : "   - "} | ${Math.round(s.up)}m`);
+        });
+        L.push(`   🔋 = tramo iniciado a partir del km 15 (con fatiga acumulada)`);
+
+        // Tendencia: regresión ponderada por km de la FC normalizada frente al tiempo
+        const t0 = new Date(`${segs[0].date}T12:00:00Z`).getTime();
+        const xs = segs.map(s => (new Date(`${s.date}T12:00:00Z`).getTime() - t0) / 86400000);
+        const ws = segs.map(s => s.km), ys = segs.map(s => s.hrNorm);
+        const W = ws.reduce((a, b) => a + b, 0);
+        const mx = xs.reduce((a, x, i) => a + x * ws[i], 0) / W, my = ys.reduce((a, y, i) => a + y * ws[i], 0) / W;
+        const sxx = xs.reduce((a, x, i) => a + ws[i] * (x - mx) ** 2, 0);
+        const slope = sxx > 0 ? xs.reduce((a, x, i) => a + ws[i] * (x - mx) * (ys[i] - my), 0) / sxx : 0;
+        const wavg = (arr) => { const w = arr.reduce((a, s) => a + s.km, 0); return w ? arr.reduce((a, s) => a + s.hrNorm * s.km, 0) / w : null; };
+        const cut = daysAgo(28);
+        const recent = segs.filter(s => s.date >= cut), older = segs.filter(s => s.date < cut);
+        const fresh = recent.filter(s => s.startKm < 15), tired = recent.filter(s => s.startKm >= 15);
+        const decs = recent.filter(s => s.dec != null).map(s => s.dec);
+
+        L.push(``, `📉 TENDENCIA`);
+        L.push(`   FC a ${target_pace}: ${slope <= 0 ? "▼" : "▲"} ${Math.abs(slope * 28).toFixed(1)} bpm cada 4 semanas ${slope < -0.5 / 28 ? "🟢 (mejorando)" : slope > 0.5 / 28 ? "🔴 (empeorando)" : "🟡 (estable)"}`);
+        if (older.length && recent.length) L.push(`   Últimas 4 semanas: ${Math.round(wavg(recent))} bpm · antes: ${Math.round(wavg(older))} bpm`);
+        if (fresh.length && tired.length) L.push(`   Últimas 4 semanas — fresco: ${Math.round(wavg(fresh))} bpm · con fatiga (km 15+): ${Math.round(wavg(tired))} bpm (+${Math.round(wavg(tired) - wavg(fresh))})`);
+        if (decs.length) L.push(`   Desacoplamiento medio (tramos ≥20 min, últimas 4 semanas): ${fmt1(mean(decs))}%`);
+        L.push(`   Km a ritmo maratón últimas 4 semanas: ${recent.reduce((a, s) => a + s.km, 0).toFixed(1)} km · tramo más largo: ${Math.max(...recent.map(s => s.km), 0).toFixed(1)} km`);
+        L.push(``, `ℹ️ FC@objetivo es una aproximación (FC × velocidad objetivo / velocidad real). Contrastar siempre con calor, desnivel y sueño del día.`);
+        return { content: [{ type: "text", text: L.join("\n") }] };
+      } catch (err) {
+        return { content: [{ type: "text", text: `❌ get_mp_trend: ${err.message}` }] };
+      }
+    }
+  );
+
+  srv.tool("project_fitness",
+    "Project CTL/ATL/TSB day by day until a date (default: next race). Uses actual loads so far, planned calendar events (their load, or estimated from duration with the athlete's own load-per-hour), and for weeks without planned events the weekly loads you pass (weekly_loads) or, by default, the average of the last 4 weeks. Reports the last 8 weeks of real load for calibration, a weekly table and the morning form (CTL/TSB) on key dates.",
+    {
+      until:        z.string().optional().describe("Fecha final YYYY-MM-DD (default: 2026-12-06)"),
+      weekly_loads: z.array(z.number()).optional().describe("Carga semanal (TSS) para cada semana SIN entrenos planificados, en orden. Si faltan semanas se repite la última"),
+      key_dates:    z.array(z.string()).optional().describe("Fechas clave YYYY-MM-DD para mostrar la forma de esa mañana (carreras)"),
+      day_pattern:  z.array(z.number()).length(7).optional().describe("Reparto de la carga semanal lun→dom (default: [0.13,0.18,0.05,0.17,0.13,0.34,0])"),
+    },
+    async ({ until = "2026-12-06", weekly_loads, key_dates, day_pattern }) => {
+      try {
+        const d = today();
+        if (until <= d) return { content: [{ type: "text", text: "❌ La fecha final debe ser futura." }] };
+        const pattern = day_pattern || [0.13, 0.18, 0.05, 0.17, 0.13, 0.34, 0];
+        const psum = pattern.reduce((a, b) => a + b, 0) || 1;
+        const histStart = addDays(mondayOf(d), -56);
+
+        const [wData, aData, eData] = await Promise.all([
+          callIntervals(`/athlete/${ATHLETE_ID}/wellness?${new URLSearchParams({ oldest: addDays(d, -3), newest: d })}`),
+          callIntervals(`/athlete/${ATHLETE_ID}/activities?${new URLSearchParams({ oldest: histStart, newest: d })}`),
+          callIntervals(`/athlete/${ATHLETE_ID}/events?${new URLSearchParams({ oldest: d, newest: until })}`),
+        ]);
+
+        // Punto de partida: CTL/ATL al final de ayer
+        const wl = toArray(wData, "wellness").filter(w => w.ctl != null && w.id < d).sort((a, b) => String(a.id).localeCompare(String(b.id)));
+        const base = wl[wl.length - 1];
+        if (!base) return { content: [{ type: "text", text: "❌ No hay CTL/ATL recientes en wellness." }] };
+        let ctl = base.ctl, atl = base.atl;
+        let cursor = addDays(base.id, 1);
+
+        // Cargas reales y ratio carga/hora por tipo (calibración con sus propios datos)
+        const acts = toArray(aData, "activities");
+        const actual = {}; const perType = {};
+        acts.forEach(a => {
+          const day = (a.start_date_local || "").split("T")[0];
+          const ld = firstDefined(a.icu_training_load, a.tss) || 0;
+          actual[day] = (actual[day] || 0) + ld;
+          const key = /run/i.test(a.type || "") ? "Run" : (a.type || "Other");
+          if (!perType[key]) perType[key] = { load: 0, secs: 0 };
+          perType[key].load += ld; perType[key].secs += a.moving_time || 0;
+        });
+        const lph = (type) => {
+          const key = /run/i.test(type || "Run") ? "Run" : type;
+          const p = perType[key];
+          return p && p.secs > 1800 ? p.load / (p.secs / 3600) : (key === "Run" ? 60 : 20);
+        };
+
+        // Historial semanal (8 semanas completas)
+        const weeks = [];
+        for (let w = 8; w >= 1; w--) {
+          const mon = addDays(mondayOf(d), -7 * w);
+          let ld = 0, km = 0;
+          acts.forEach(a => {
+            const day = (a.start_date_local || "").split("T")[0];
+            if (day >= mon && day <= addDays(mon, 6)) { ld += firstDefined(a.icu_training_load, a.tss) || 0; if (/run/i.test(a.type || "")) km += (a.distance || 0) / 1000; }
+          });
+          weeks.push({ mon, ld, km });
+        }
+        const avg4 = mean(weeks.slice(-4).map(w => w.ld));
+
+        // Entrenos planificados
+        const planned = {}; let lastPlanned = null, estimated = 0;
+        toArray(eData, "events").forEach(e => {
+          if (e.category && e.category !== "WORKOUT") return;
+          const day = (e.start_date_local || "").split("T")[0];
+          let ld = firstDefined(e.icu_training_load, e.load);
+          if (ld == null && e.moving_time) { ld = e.moving_time / 3600 * lph(e.type); estimated++; }
+          if (ld == null) return;
+          planned[day] = (planned[day] || 0) + ld;
+          if (!lastPlanned || day > lastPlanned) lastPlanned = day;
+        });
+        // Semanas genéricas: a partir del lunes siguiente al último entreno planificado (o del lunes que viene)
+        const genericFrom = addDays(mondayOf(lastPlanned && lastPlanned >= d ? lastPlanned : d), 7);
+
+        const kc = 1 - Math.exp(-1 / 42), ka = 1 - Math.exp(-1 / 7);
+        const series = {}; const weekRows = []; let wkLoad = 0;
+        let genericIdx = -1, lastGenericMon = null;
+        while (cursor <= until) {
+          let ld;
+          if (cursor < d) ld = actual[cursor] || 0;
+          else if (cursor === d && actual[cursor]) ld = actual[cursor];
+          else if (cursor < genericFrom) ld = planned[cursor] || 0;
+          else {
+            const mon = mondayOf(cursor);
+            if (mon !== lastGenericMon) { genericIdx++; lastGenericMon = mon; }
+            const wk = weekly_loads?.length ? weekly_loads[Math.min(genericIdx, weekly_loads.length - 1)] : avg4;
+            const dow = dayOfWeek(cursor); // 0=dom
+            ld = wk * pattern[dow === 0 ? 6 : dow - 1] / psum;
+          }
+          series[cursor] = { ctlPrev: ctl, atlPrev: atl };
+          ctl += (ld - ctl) * kc; atl += (ld - atl) * ka;
+          wkLoad += ld;
+          if (dayOfWeek(cursor) === 0 || cursor === until) {
+            weekRows.push({ end: cursor, ld: wkLoad, ctl, atl, src: cursor < genericFrom ? "plan" : "supuesto" });
+            wkLoad = 0;
+          }
+          cursor = addDays(cursor, 1);
+        }
+
+        const L = [`🔮 PROYECCIÓN DE CARGA hasta ${until}`, `   Punto de partida (${base.id}): CTL ${fmt1(base.ctl)} · ATL ${fmt1(base.atl)}`, ``, `📚 CARGA REAL — últimas 8 semanas`];
+        weeks.forEach(w => L.push(`   sem ${w.mon}: ${fmt0(w.ld)} TSS · ${w.km.toFixed(0)} km`));
+        L.push(`   Media últimas 4 semanas: ${fmt0(avg4)} TSS/semana · carrera ≈ ${fmt0(lph("Run"))} TSS/h`);
+        L.push(``, `📅 PROYECCIÓN SEMANAL (fin de semana, domingo)`, `   semana      | carga | CTL  | ATL  | TSB   | origen`);
+        weekRows.forEach(r => L.push(`   ${r.end} | ${fmt0(r.ld).padStart(5)} | ${fmt1(r.ctl).padStart(4)} | ${fmt1(r.atl).padStart(4)} | ${fmt1(r.ctl - r.atl).padStart(5)} | ${r.src}`));
+        const peak = weekRows.reduce((m, r) => r.ctl > m.ctl ? r : m, weekRows[0]);
+        L.push(`   Pico de CTL: ${fmt1(peak.ctl)} (semana que acaba el ${peak.end})`);
+
+        const kd = [...new Set([...(key_dates || []), until])].filter(x => series[x]).sort();
+        if (kd.length) {
+          L.push(``, `🏁 FORMA LA MAÑANA DE LAS FECHAS CLAVE`);
+          kd.forEach(x => { const s = series[x]; const tsb = s.ctlPrev - s.atlPrev; L.push(`   ${x}: CTL ${fmt1(s.ctlPrev)} · TSB ${fmt1(tsb)} ${tsb >= 8 && tsb <= 15 ? "🎯" : tsb > 15 ? "🟢 (muy fresco)" : tsb >= 0 ? "🟡" : "🟠"}`); });
+        }
+        L.push(``, `ℹ️ Semanas "plan" = entrenos del calendario${estimated ? ` (${estimated} con carga estimada por duración)` : ""}; "supuesto" = ${weekly_loads?.length ? "cargas indicadas" : "media de las últimas 4 semanas"}. Modelo exponencial 42/7 días; puede diferir ±1 punto de intervals.`);
+        return { content: [{ type: "text", text: L.join("\n") }] };
+      } catch (err) {
+        return { content: [{ type: "text", text: `❌ project_fitness: ${err.message}` }] };
+      }
+    }
+  );
+
   return srv;
 }
 
@@ -1847,9 +2075,9 @@ app.delete(MCP_PATHS, requireAuth, async (req, res) => {
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/health", (_, res) => res.json({
-  status: "ok", version: "5.2.0", transport: "streamable-http", sessions: sessions.size, auth: !!AUTH_TOKEN
+  status: "ok", version: "6.0.0", transport: "streamable-http", sessions: sessions.size, auth: !!AUTH_TOKEN
 }));
 
 app.listen(PORT, () => {
-  console.log(`✅ Intervals MCP v5.2 (Streamable HTTP) — port ${PORT} — athlete ${ATHLETE_ID} — ${AUTH_TOKEN ? "🔒 token activo" : "⚠️ SIN token: endpoint abierto"}`);
+  console.log(`✅ Intervals MCP v6 (Streamable HTTP) — port ${PORT} — athlete ${ATHLETE_ID} — ${AUTH_TOKEN ? "🔒 token activo" : "⚠️ SIN token: endpoint abierto"}`);
 });

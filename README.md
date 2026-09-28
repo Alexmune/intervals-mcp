@@ -39,6 +39,15 @@ Si `MCP_AUTH_TOKEN` está definido, `/sse` sin token devuelve 401. También se a
 
 ---
 
+## Novedades v6.0.0
+
+**Herramientas nuevas (2) → 29 en total:**
+
+| Tool | Qué hace |
+|---|---|
+| `get_mp_trend` | Indicador de preparación para el ritmo maratón: localiza todos los tramos continuos dentro de una banda de ritmo (por defecto 4:10-4:22/km) y da, por tramo, ritmo, FC, FC normalizada al ritmo objetivo, desacoplamiento, desnivel y km de inicio (fatiga). Calcula la tendencia del coste cardíaco del ritmo maratón |
+| `project_fitness` | Proyecta CTL/ATL/TSB día a día hasta una fecha usando cargas reales, entrenos planificados (con carga estimada por duración si no la traen) y cargas semanales supuestas. Incluye las 8 últimas semanas reales para calibrar y la forma la mañana de las fechas clave |
+
 ## Novedades v5.2.0
 
 - Selección de la configuración de running: prioridad al tipo exacto `Run`. Antes podía coger la configuración "Otro" (Walk/Hike), con zonas por defecto distintas, y mostrar etiquetas de zona erróneas — y `update_sport_settings` habría escrito en la configuración equivocada
