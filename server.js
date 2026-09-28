@@ -308,7 +308,7 @@ function bestEffort(time, rawDist, targetM) {
 
 // ─── MCP Server factory ───────────────────────────────────────────────────────
 function createServer() {
-  const srv = new McpServer({ name: "intervals-mcp", version: "6.4.0" });
+  const srv = new McpServer({ name: "intervals-mcp", version: "6.5.0" });
 
   srv.tool("get_athlete_profile",
     "Get full athlete profile: demographics, weight, HR zones, pace zones, FTP, VO2max, thresholds. Dumps all available fields.",
@@ -867,6 +867,7 @@ function createServer() {
             w.hrv          ? `   💓 HRV: ${w.hrv}` : null,
             w.restingHR    ? `   ❤️  FC reposo: ${w.restingHR} bpm` : null,
             w.sleepSecs    ? `   😴 Sueño: ${fmtSleep(w.sleepSecs)}` : null,
+            w.vo2max       ? `   🫁 VO2max: ${w.vo2max}` : null,
             w.sleepScore   ? `   💤 Calidad sueño: ${w.sleepScore}/100` : null,
             w.sleepQuality != null ? `   💤 Calidad (1-5): ${w.sleepQuality}/5` : null,
             w.steps        ? `   👣 Pasos: ${w.steps.toLocaleString()}` : null,
@@ -1486,6 +1487,12 @@ function createServer() {
           L.push(`   Noches ≥7h 30min (últimos 7 días): ${ok}/${nights.length}`);
         }
         ["fatigue","soreness","mood","motivation"].forEach(k => { if (w[k] != null) L.push(`   ${k}: ${w[k]}`); });
+        const vo2Hist = wl.filter(x => x.vo2max > 0);
+        if (vo2Hist.length) {
+          const vNow = vo2Hist[vo2Hist.length - 1], vOld = vo2Hist[0];
+          const diff = vNow.vo2max - vOld.vo2max;
+          L.push(`   VO2max (Garmin): ${vNow.vo2max}${vNow.id !== d ? ` (dato del ${vNow.id})` : ""}${vo2Hist.length > 1 && vOld.id !== vNow.id ? ` · ${diff > 0 ? "+" : ""}${diff} desde ${vOld.id}` : ""}`);
+        }
 
         L.push(``, `📊 CARGA`);
         if (loadEntry.ctl != null) {
@@ -2212,9 +2219,9 @@ app.delete(MCP_PATHS, requireAuth, async (req, res) => {
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/health", (_, res) => res.json({
-  status: "ok", version: "6.4.0", transport: "streamable-http", sessions: sessions.size, auth: !!AUTH_TOKEN
+  status: "ok", version: "6.5.0", transport: "streamable-http", sessions: sessions.size, auth: !!AUTH_TOKEN
 }));
 
 app.listen(PORT, () => {
-  console.log(`✅ Intervals MCP v6.4 (Streamable HTTP) — port ${PORT} — athlete ${ATHLETE_ID} — ${AUTH_TOKEN ? "🔒 token activo" : "⚠️ SIN token: endpoint abierto"}`);
+  console.log(`✅ Intervals MCP v6.5 (Streamable HTTP) — port ${PORT} — athlete ${ATHLETE_ID} — ${AUTH_TOKEN ? "🔒 token activo" : "⚠️ SIN token: endpoint abierto"}`);
 });

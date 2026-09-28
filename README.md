@@ -39,6 +39,10 @@ Si `MCP_AUTH_TOKEN` está definido, `/sse` sin token devuelve 401. También se a
 
 ---
 
+## Novedades v6.5.0
+
+- `get_daily_briefing` y `get_wellness`: muestran el VO2max que Garmin sincroniza en wellness, con su evolución en 30 días
+
 ## Novedades v6.4.0
 
 - Todas las llamadas a intervals: máximo 3 peticiones simultáneas y reintentos automáticos con espera progresiva ante 429 (límite de peticiones) y errores 5xx. Antes, un 429 hacía que actividades desaparecieran en silencio de `get_mp_trend` y `get_best_efforts`
