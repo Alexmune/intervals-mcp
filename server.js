@@ -8,7 +8,7 @@ import { z } from "zod";
 const API_KEY    = process.env.INTERVALS_API_KEY;
 const ATHLETE_ID = process.env.INTERVALS_ATHLETE_ID;
 const PORT       = process.env.PORT || 3000;
-const BASE_URL   = "https://intervals.icu/api/v1";
+const BASE_URL   = process.env.INTERVALS_BASE_URL || "https://intervals.icu/api/v1";
 const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN || null;          // secreto para proteger el endpoint
 const TZ         = process.env.TIMEZONE || "Europe/Madrid";     // zona horaria del atleta
 
@@ -101,10 +101,8 @@ function toArray(data, key) {
 
 function fmtPace(mps) {
   if (!mps || mps <= 0) return null;
-  const minkm = 1000 / mps / 60;
-  const mins  = Math.floor(minkm);
-  const secs  = Math.round((minkm - mins) * 60);
-  return `${mins}:${String(secs).padStart(2, "0")} min/km`;
+  const total = Math.round(1000 / mps);
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")} min/km`;
 }
 
 function fmtDuration(secs) {
@@ -152,32 +150,6 @@ const stdev = (arr) => {
 };
 const firstDefined = (...vals) => vals.find(v => v != null && v !== "" && !(typeof v === "number" && isNaN(v)));
 const cleanId = (id) => String(id).replace(/^i/, "");
-
-// ─── Actividad completa (cualquier fecha, no solo 60 días) ───────────────────
-async function fetchActivity(activity_id) {
-  try { return await callIntervals(`/activity/${activity_id}`); }
-  catch (_) { return await callIntervals(`/activity/${cleanId(activity_id)}`); }
-}
-
-async function fetchStreams(activity_id, types = "time,heartrate,velocity_smooth,distance,cadence,altitude") {
-  const params = new URLSearchParams({ types });
-  let raw;
-  try { raw = await callIntervals(`/activity/${activity_id}/streams?${params}`); }
-  catch (_) { raw = await callIntervals(`/activity/${cleanId(activity_id)}/streams?${params}`); }
-  const streams = Array.isArray(raw) ? raw : (raw ? [raw] : []);
-  const byType = {};
-  streams.forEach(s => { if (s.type) byType[s.type] = s.data || []; });
-  return {
-    time: byType.time || [],
-    hr:   byType.heartrate || byType.heart_rate || [],
-    vel:  byType.velocity_smooth || byType.speed || byType.velocity || [],
-    dist: byType.distance || [],
-    cad:  byType.cadence || [],
-    alt:  byType.altitude || [],
-    pwr:  byType.watts || byType.power || [],
-    types: Object.keys(byType),
-  };
-}
 
 // ─── Zonas de FC dinámicas (leídas de intervals, no fijas en el código) ──────
 const DEFAULT_HR_UPPER = [133, 148, 163, 178, 193];
@@ -307,1050 +279,1071 @@ function bestEffort(time, rawDist, targetM) {
 }
 
 // ─── MCP Server factory ───────────────────────────────────────────────────────
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v7 — CACHÉ, ANÁLISIS DE ENTRENOS, TRAMOS A RITMO MARATÓN Y SEMÁFORO
+// ═══════════════════════════════════════════════════════════════════════════
+const RACE_DATE = process.env.RACE_DATE || "2026-12-06";
+const HOUR = 3600 * 1000;
+
+// ─── Caché LRU en memoria ─────────────────────────────────────────────────────
+// Streams e intervalos de una actividad terminada no cambian → se piden una sola vez.
+// Se guarda la promesa: dos herramientas que piden lo mismo a la vez comparten la petición.
+class LRU {
+  constructor(max) { this.max = max; this.m = new Map(); this.hits = 0; this.miss = 0; }
+  get(k) {
+    const e = this.m.get(k);
+    if (!e) { this.miss++; return undefined; }
+    if (Date.now() > e.exp) { this.m.delete(k); this.miss++; return undefined; }
+    this.m.delete(k); this.m.set(k, e); this.hits++;
+    return e.v;
+  }
+  set(k, v, ttl) {
+    this.m.delete(k); this.m.set(k, { v, exp: Date.now() + ttl });
+    while (this.m.size > this.max) this.m.delete(this.m.keys().next().value);
+  }
+  del(pred) { for (const k of [...this.m.keys()]) if (pred(k)) this.m.delete(k); }
+  get size() { return this.m.size; }
+}
+const streamCache = new LRU(Number(process.env.STREAM_CACHE_MAX) || 50); // pesados
+const dataCache   = new LRU(1000);                                        // ligeros
+
+async function cached(store, key, ttl, fn) {
+  const hit = store.get(key);
+  if (hit !== undefined) return hit;
+  const p = Promise.resolve().then(fn);
+  store.set(key, p, ttl);
+  try { return await p; }
+  catch (e) { store.del(k => k === key); throw e; }
+}
+
+// GET sobre /activity/{id}{suffix}: prueba el ID tal cual y, ante 404, sin la "i"
+async function activityGet(activity_id, suffix = "") {
+  try { return await callIntervals(`/activity/${activity_id}${suffix}`); }
+  catch (e) {
+    if (String(activity_id) === cleanId(activity_id) || !/ 404/.test(e.message)) throw e;
+    return await callIntervals(`/activity/${cleanId(activity_id)}${suffix}`);
+  }
+}
+
+// ─── Actividad completa (cualquier fecha) ────────────────────────────────────
+async function fetchActivity(activity_id) {
+  return cached(dataCache, `act:${cleanId(activity_id)}`, 2 * 60 * 1000, () => activityGet(activity_id));
+}
+
+// Streams: siempre el conjunto completo, en caché 24 h (el parámetro types se ignora)
+const STREAM_TYPES = "time,heartrate,velocity_smooth,distance,cadence,altitude,watts";
+async function fetchStreams(activity_id, _types) {
+  return cached(streamCache, `st:${cleanId(activity_id)}`, 24 * HOUR, async () => {
+    const raw = await activityGet(activity_id, `/streams?${new URLSearchParams({ types: STREAM_TYPES })}`);
+    const streams = Array.isArray(raw) ? raw : (raw ? [raw] : []);
+    const byType = {};
+    streams.forEach(s => { if (s.type) byType[s.type] = s.data || []; });
+    return {
+      time: byType.time || [],
+      hr:   byType.heartrate || byType.heart_rate || [],
+      vel:  byType.velocity_smooth || byType.speed || byType.velocity || [],
+      dist: byType.distance || [],
+      cad:  byType.cadence || [],
+      alt:  byType.altitude || [],
+      pwr:  byType.watts || byType.power || [],
+      types: Object.keys(byType),
+    };
+  });
+}
+
+// Intervalos (pasos del entreno estructurado / vueltas). null si no hay (404). Caché 6 h.
+async function fetchIntervals(activity_id) {
+  return cached(dataCache, `iv:${cleanId(activity_id)}`, 6 * HOUR, async () => {
+    try { return await activityGet(activity_id, "/intervals"); }
+    catch (e) { if (/ 404/.test(e.message)) return null; throw e; }
+  });
+}
+
+// Lista de actividades de un rango (caché 60 s: evita pedirla dos veces en la misma consulta)
+async function listActivities(oldest, newest) {
+  return cached(dataCache, `acts:${oldest}:${newest}`, 60 * 1000, async () =>
+    toArray(await callIntervals(`/athlete/${ATHLETE_ID}/activities?${new URLSearchParams({ oldest, newest })}`), "activities")
+      .sort((a, b) => String(a.start_date_local).localeCompare(String(b.start_date_local))));
+}
+
+function invalidateActivity(activity_id) {
+  const id = cleanId(activity_id);
+  dataCache.del(k => k === `act:${id}` || k.startsWith("acts:"));
+}
+
+// ─── Utilidades de ritmo ─────────────────────────────────────────────────────
+const paceToSecs = (s) => { const m = String(s).trim().match(/^(\d{1,2}):(\d{2})$/); return m ? +m[1] * 60 + +m[2] : null; };
+const pS = (mps) => (mps > 0 ? fmtSecs(1000 / mps) : "-");            // m/s → "m:ss"
+const actDate = (a) => (a.start_date_local || a.date || "").split("T")[0];
+const isRun = (a) => /run/i.test(a.type || "");
+const DOW = ["Dom", "Lun", "Mar", "Mié", "Jue", "Vie", "Sáb"];
+const dayLabel = (ds) => `${DOW[dayOfWeek(ds)]} ${Number(ds.slice(8))}`;
+
+// ─── Parser del formato de entreno de intervals.icu ──────────────────────────
+// "- 2km 5:20-5:40 Pace intensity=warmup" · "8x" abre un bloque que termina en línea en blanco
+function parseLenToken(tok) {
+  let m;
+  if ((m = tok.match(/^(\d+(?:[.,]\d+)?)km$/i))) return { meters: parseFloat(m[1].replace(",", ".")) * 1000 };
+  if ((m = tok.match(/^(\d+)mtrs?$/i))) return { meters: +m[1] };
+  if ((m = tok.match(/^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/i)) && (m[1] || m[2] || m[3]))
+    return { secs: (+(m[1] || 0)) * 3600 + (+(m[2] || 0)) * 60 + (+(m[3] || 0)) };
+  return {};
+}
+function parseWorkoutText(text) {
+  const out = []; let rep = null;
+  const flush = () => {
+    if (!rep) return;
+    for (let i = 0; i < rep.n; i++) rep.steps.forEach(s => out.push({ ...s, rep: i + 1, reps: rep.n }));
+    rep = null;
+  };
+  for (const raw of String(text || "").split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) { flush(); continue; }
+    const r = line.match(/^(\d+)\s*x$/i);
+    if (r) { flush(); rep = { n: +r[1], steps: [] }; continue; }
+    if (!line.startsWith("-")) continue;
+    const body = line.slice(1).trim();
+    const st = { ...parseLenToken(body.split(/\s+/)[0]) };
+    const im = body.match(/intensity=(\w+)/i);
+    st.intensity = (im ? im[1] : "active").toLowerCase();
+    const pr = body.match(/(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})\s*Pace/i);
+    const p1 = body.match(/(\d{1,2}:\d{2})\s*Pace/i);
+    if (pr) { const a = paceToSecs(pr[1]), b = paceToSecs(pr[2]); st.fast = Math.min(a, b); st.slow = Math.max(a, b); }
+    else if (p1) { const a = paceToSecs(p1[1]); st.fast = a - 3; st.slow = a + 3; }
+    (rep ? rep.steps : out).push(st);
+  }
+  flush();
+  return out;
+}
+const isRestStep = (s) => /recovery|rest|warmup|cooldown/.test(s.intensity);
+const plannedKm = (e) => {
+  if (e.distance > 0) return e.distance / 1000;
+  const st = parseWorkoutText(e.description);
+  return st.length && st.every(s => s.meters) ? st.reduce((a, s) => a + s.meters, 0) / 1000 : null;
+};
+
+// ─── Cumplimiento repetición a repetición ────────────────────────────────────
+// Empareja los intervalos registrados con los pasos del entreno planificado.
+function repCompliance(ivsRaw, steps) {
+  const ivs = (ivsRaw || []).filter(iv => (iv.distance || 0) > 0 && (iv.moving_time || iv.elapsed_time || 0) > 0)
+    .sort((x, y) => (x.start_index ?? 0) - (y.start_index ?? 0));
+  const targets = steps.filter(s => !isRestStep(s) && s.fast != null);
+  if (!ivs.length || !targets.length) return null;
+  const work = ivs.filter(iv => String(iv.type || "").toUpperCase() === "WORK");
+  let pairs, mode;
+  if (ivs.length === steps.length) {
+    pairs = ivs.map((iv, i) => ({ iv, st: steps[i] })).filter(p => !isRestStep(p.st) && p.st.fast != null); mode = "exacto";
+  } else if (work.length === targets.length) {
+    pairs = work.map((iv, i) => ({ iv, st: targets[i] })); mode = "por bloques de trabajo";
+  } else {
+    // Aproximado: cada intervalo de trabajo con el objetivo más cercano (±25 s/km)
+    const cand = (work.length ? work : ivs.filter(iv => (iv.moving_time || iv.elapsed_time) >= 60));
+    const uniq = [...new Map(targets.map(t => [`${t.fast}-${t.slow}`, t])).values()];
+    pairs = cand.map(iv => {
+      const p = 1000 / (iv.average_speed || iv.distance / (iv.moving_time || iv.elapsed_time));
+      const st = uniq.map(t => ({ t, d: p < t.fast ? t.fast - p : p > t.slow ? p - t.slow : 0 })).sort((a, b) => a.d - b.d)[0];
+      return st && st.d <= 25 ? { iv, st: st.t } : null;
+    }).filter(Boolean);
+    mode = "aproximado";
+  }
+  if (!pairs.length) return null;
+  const rows = pairs.map(({ iv, st }, i) => {
+    const secs = iv.moving_time || iv.elapsed_time;
+    const pace = 1000 / (iv.average_speed || iv.distance / secs);
+    const status = pace < st.fast - 2 ? `⚡${Math.round(st.fast - pace)}s` : pace > st.slow + 2 ? `🐢${Math.round(pace - st.slow)}s` : "✅";
+    return { n: i + 1, km: iv.distance / 1000, secs, pace, st, hr: iv.average_heartrate, max: iv.max_heartrate, status };
+  });
+  const ok = rows.filter(r => r.status === "✅").length;
+  const fast = rows.filter(r => r.status.startsWith("⚡")).length, slow = rows.filter(r => r.status.startsWith("🐢")).length;
+  const hrs = rows.filter(r => r.hr > 0);
+  return {
+    mode, rows, ok, fast, slow,
+    meanPace: mean(rows.map(r => r.pace)),
+    hrFirst: hrs.length ? hrs[0].hr : null, hrLast: hrs.length ? hrs[hrs.length - 1].hr : null,
+    maxHr: Math.max(0, ...rows.map(r => r.max || 0)) || null,
+  };
+}
+function complianceSummary(c) {
+  return `${c.ok}/${c.rows.length} en rango${c.fast ? ` · ${c.fast} rápidas` : ""}${c.slow ? ` · ${c.slow} lentas` : ""} · media ${fmtSecs(c.meanPace)}` +
+    `${c.hrFirst ? ` · FC 1ª→última ${Math.round(c.hrFirst)}→${Math.round(c.hrLast)}` : ""}${c.maxHr ? ` · máx ${Math.round(c.maxHr)}` : ""}`;
+}
+
+// Entreno planificado emparejado con una actividad (paired_event_id o mismo día y tipo)
+function pairedEvent(a, events) {
+  const byId = a.paired_event_id != null ? events.find(e => String(e.id) === String(a.paired_event_id)) : null;
+  if (byId) return byId;
+  const day = actDate(a);
+  const same = events.filter(e => (e.start_date_local || "").startsWith(day) && (!e.category || e.category === "WORKOUT" || String(e.category).startsWith("RACE"))
+    && (isRun(a) ? /run/i.test(e.type || "Run") : !/run/i.test(e.type || "Run")));
+  if (same.length <= 1) return same[0] || null;
+  const km = (a.distance || 0) / 1000;
+  return same.sort((x, y) => Math.abs((plannedKm(x) || 0) - km) - Math.abs((plannedKm(y) || 0) - km))[0];
+}
+
+// ─── Tramos a ritmo maratón (compartido por get_mp_trend, informe post-entreno y revisión) ──
+function mpBand(target = "4:16", fast = "4:05", slow = "4:25", minKm = 2) {
+  const vT = paceStrToMps(target), vF = paceStrToMps(fast), vS = paceStrToMps(slow);
+  if (!vT || !vF || !vS || vF <= vS) return null;
+  // Tolerancia de 4 s/km en los bordes de la banda
+  const vHi = 1000 / (1000 / vF - 4), vLo = 1000 / (1000 / vS + 4);
+  return { vT, vHi, vLo, minKm, target, key: `${target}|${fast}|${slow}|${minKm}` };
+}
+
+// Métricas de un tramo [start..last] (GAP, FC sin retardo, desnivel, desacoplamiento)
+function segMetrics(st, gv, start, last) {
+  const { hr, dist, alt } = st;
+  const tOf = (x) => st.time.length ? st.time[x] : x;
+  const segM = (dist[last] || 0) - (dist[start] || 0);
+  const secs = tOf(last) - tOf(start);
+  if (segM <= 0 || secs <= 0) return null;
+  const hrFrom = secs > 300 ? start + Math.min(90, Math.floor((last - start) / 4)) : start;
+  const hrVals = []; for (let x = hrFrom; x <= last; x++) if (hr[x] > 60) hrVals.push(hr[x]);
+  const gVals = []; for (let x = start; x <= last; x++) gVals.push(gv[x]);
+  let up = 0;
+  if (alt.length) { for (let x = start + 10; x <= last; x += 10) { const dz = (alt[x] || 0) - (alt[x - 10] || 0); if (dz > 0) up += dz; } }
+  const dec = secs >= 1200 ? computeDecoupling({ ...st, vel: gv }, dist[start], dist[last]) : null;
+  return { startKm: (dist[start] || 0) / 1000, endKm: (dist[last] || 0) / 1000, km: segM / 1000, v: segM / secs,
+           vg: mean(gVals) || segM / secs, hr: hrVals.length >= 60 ? mean(hrVals) : null, up, dec: dec ? dec.decoupling : null };
+}
+
+async function computeMpSegments(a, band) {
+  const segs = [];
+  const push = (m, src) => {
+    if (!m || !m.hr) return;
+    segs.push({ date: actDate(a), name: a.name || "", src, startKm: m.startKm, endKm: m.endKm ?? m.startKm + m.km, km: m.km,
+                pace: 1000 / m.v, gap: 1000 / m.vg, hr: m.hr, hrNorm: m.hr * (band.vT / m.vg), dec: m.dec, up: m.up });
+  };
+  const inBand = (sp) => sp >= band.vLo && sp <= band.vHi;
+
+  // 1) Intervalos de intervals (pasos del entreno estructurado o vueltas)
+  let ivs = [], ivErr = null;
+  try { ivs = ((await fetchIntervals(a.id))?.icu_intervals || []).filter(iv => (iv.distance || 0) > 0 && (iv.moving_time || iv.elapsed_time || 0) > 0); }
+  catch (e) { ivErr = e; }
+  ivs.sort((x, y) => (x.start_index ?? 0) - (y.start_index ?? 0));
+  const groups = []; let cur = null, before = 0; const startDist = [];
+  ivs.forEach(iv => {
+    startDist.push(before); before += iv.distance || 0;
+    const sp = iv.average_speed || (iv.distance / (iv.moving_time || iv.elapsed_time));
+    if (inBand(sp)) (cur = cur || []).push(iv); else { if (cur) groups.push(cur); cur = null; }
+  });
+  if (cur) groups.push(cur);
+  const cands = groups.map(g => {
+    const dist = g.reduce((s, iv) => s + (iv.distance || 0), 0);
+    const secs = g.reduce((s, iv) => s + (iv.moving_time || iv.elapsed_time || 0), 0);
+    const hrW  = g.reduce((s, iv) => s + (iv.average_heartrate || 0) * (iv.moving_time || iv.elapsed_time || 0), 0);
+    return { dist, secs, hr: secs ? hrW / secs : null, startIdx: g[0].start_index, endIdx: g[g.length - 1].end_index, startKm: startDist[ivs.indexOf(g[0])] / 1000 };
+  }).filter(c => c.dist >= band.minKm * 1000);
+
+  let st = null, gv = null;
+  const load = async () => {
+    if (st) return st;
+    try { st = await fetchStreams(a.id); gv = gapVelocity(st.vel, st.dist, st.alt); } catch (_) { st = null; }
+    return st;
+  };
+
+  if (cands.length) {
+    await load();
+    for (const c of cands) {
+      const n = st ? Math.min(st.vel.length, st.dist.length) : 0;
+      const ok = st && c.startIdx != null && c.endIdx != null && c.endIdx < n && c.endIdx > c.startIdx;
+      const m = ok ? segMetrics(st, gv, c.startIdx, c.endIdx) : null;
+      if (m) push({ ...m, km: c.dist / 1000, v: c.dist / c.secs, hr: m.hr ?? c.hr }, "int");
+      else push({ startKm: c.startKm, km: c.dist / 1000, v: c.dist / c.secs, vg: c.dist / c.secs, hr: c.hr, up: 0, dec: null }, "int");
+    }
+    return { segs, failed: ivErr ? "gps" : null };
+  }
+
+  // 2) Respaldo: detección sobre los streams (carreras sin vueltas útiles)
+  if (!await load()) return { segs, failed: "full" };
+  const n = Math.min(st.vel.length, st.dist.length);
+  if (n >= 300 && st.hr.length) {
+    const rv = new Array(n); let acc = 0;
+    for (let k = 0; k < n; k++) { acc += gv[k] || 0; if (k >= 60) acc -= gv[k - 60] || 0; rv[k] = acc / Math.min(k + 1, 60); }
+    let k = 0;
+    while (k < n) {
+      if (!inBand(rv[k])) { k++; continue; }
+      let start = k, last = k, gap = 0; k++;
+      while (k < n) { if (inBand(rv[k])) { last = k; gap = 0; } else if (++gap > 45) break; k++; }
+      if ((st.dist[last] || 0) - (st.dist[start] || 0) < band.minKm * 1000) continue;
+      push(segMetrics(st, gv, start, last), "gps");
+    }
+  }
+  return { segs, failed: ivErr ? "gps" : null };
+}
+
+// Con caché de 7 días por actividad: el domingo siguiente solo se procesan las carreras nuevas
+async function mpSegmentsFor(a, band) {
+  const key = `mp:${cleanId(a.id)}:${band.key}`;
+  const hit = dataCache.get(key);
+  if (hit !== undefined) return hit;
+  const res = await computeMpSegments(a, band);
+  if (!res.failed) dataCache.set(key, res, 7 * 24 * HOUR);
+  return res;
+}
+
+async function computeMpTrend({ target_pace = "4:16", pace_fast = "4:05", pace_slow = "4:25", days = 90, min_km = 2, include_treadmill = false } = {}) {
+  const band = mpBand(target_pace, pace_fast, pace_slow, min_km);
+  if (!band) return { error: "❌ Ritmos no válidos (formato m:ss, pace_fast más rápido que pace_slow)." };
+  const nDays = Math.min(days, 180);
+  const acts = (await listActivities(daysAgo(nDays), today()))
+    .filter(a => (a.type === "Run" || (include_treadmill && a.type === "VirtualRun")) && (a.distance || 0) >= min_km * 1000 && !(a.trainer && !include_treadmill))
+    .filter(a => { const sp = a.average_speed || 0; return sp === 0 || sp > band.vLo * 0.75; });
+  const segs = [], failed = [];
+  for (let i = 0; i < acts.length; i += 3) {
+    const res = await Promise.all(acts.slice(i, i + 3).map(a => mpSegmentsFor(a, band).then(r => ({ a, r }))));
+    res.forEach(({ a, r }) => {
+      segs.push(...r.segs);
+      if (r.failed === "full") failed.push(actDate(a)); else if (r.failed === "gps") failed.push(`${actDate(a)} (solo GPS)`);
+    });
+  }
+  segs.sort((x, y) => x.date.localeCompare(y.date) || x.startKm - y.startKm);
+  return { segs, failed, nDays, target_pace, pace_fast, pace_slow, min_km };
+}
+
+function mpTrendLines(r, { table = true } = {}) {
+  const { segs, failed, nDays, target_pace, pace_fast, pace_slow, min_km } = r;
+  const failNote = failed.length ? `⚠️ ${failed.length} actividad(es) no se pudieron leer completas: ${failed.join(", ")}. Repetir en unos minutos.` : null;
+  if (!segs.length) return [`No hay tramos de ≥${min_km} km entre ${pace_fast} y ${pace_slow}/km en los últimos ${nDays} días.`, failNote].filter(Boolean);
+  const L = [];
+  if (table) {
+    L.push(`🎯 COSTE CARDÍACO DEL RITMO MARATÓN — banda ${pace_fast}-${pace_slow}/km · normalizado a ${target_pace}`,
+           `   ${segs.length} tramos en ${new Set(segs.map(s => s.date)).size} sesiones (últimos ${nDays} días)`, ``,
+           `fecha      | inicio | tramo  | ritmo | GAP  | FC  | FC@${target_pace} | desac | desn+`);
+    segs.slice(-25).forEach(s => {
+      L.push(`${s.date}${s.src === "gps" ? "*" : " "}| ${s.startKm >= 15 ? "🔋" : "  "}${s.startKm.toFixed(1).padStart(4)} | ${s.km.toFixed(1).padStart(4)}km | ${fmtSecs(s.pace)} | ${fmtSecs(s.gap)} | ${Math.round(s.hr)} | ${Math.round(s.hrNorm).toString().padStart(3)}     | ${s.dec != null ? fmt1(s.dec).padStart(4) + "%" : "   - "} | ${Math.round(s.up)}m`);
+    });
+    L.push(`   🔋 = tramo iniciado a partir del km 15 · * = detectado por GPS (sin vueltas), menos preciso`);
+  }
+  // Tendencia: regresión ponderada por km de la FC normalizada frente al tiempo
+  const t0 = new Date(`${segs[0].date}T12:00:00Z`).getTime();
+  const xs = segs.map(s => (new Date(`${s.date}T12:00:00Z`).getTime() - t0) / 86400000);
+  const ws = segs.map(s => s.km), ys = segs.map(s => s.hrNorm);
+  const W = ws.reduce((a, b) => a + b, 0);
+  const mx = xs.reduce((a, x, i) => a + x * ws[i], 0) / W, my = ys.reduce((a, y, i) => a + y * ws[i], 0) / W;
+  const sxx = xs.reduce((a, x, i) => a + ws[i] * (x - mx) ** 2, 0);
+  const slope = sxx > 0 ? xs.reduce((a, x, i) => a + ws[i] * (x - mx) * (ys[i] - my), 0) / sxx : 0;
+  const wavg = (arr) => { const w = arr.reduce((a, s) => a + s.km, 0); return w ? arr.reduce((a, s) => a + s.hrNorm * s.km, 0) / w : null; };
+  const cut = daysAgo(28);
+  const recent = segs.filter(s => s.date >= cut), older = segs.filter(s => s.date < cut);
+  const fresh = recent.filter(s => s.startKm < 15), tired = recent.filter(s => s.startKm >= 15);
+  const decs = recent.filter(s => s.dec != null).map(s => s.dec);
+  const nSessions = new Set(segs.map(s => s.date)).size;
+  const span = xs[xs.length - 1] - xs[0];
+  L.push(table ? `` : null, `📉 TENDENCIA RITMO MARATÓN${table ? "" : ` (${segs.length} tramos, ${nDays} días)`}`);
+  if (nSessions >= 3 && span >= 21) L.push(`   FC a ${target_pace}: ${slope <= 0 ? "▼" : "▲"} ${Math.abs(slope * 28).toFixed(1)} bpm cada 4 semanas ${slope < -0.5 / 28 ? "🟢 (mejorando)" : slope > 0.5 / 28 ? "🔴 (empeorando)" : "🟡 (estable)"}`);
+  else L.push(`   ⚠️ Datos insuficientes para una tendencia fiable (${nSessions} sesiones en ${Math.round(span)} días)`);
+  if (older.length && recent.length) L.push(`   Últimas 4 semanas: ${Math.round(wavg(recent))} bpm · antes: ${Math.round(wavg(older))} bpm`);
+  if (fresh.length && tired.length) L.push(`   Fresco: ${Math.round(wavg(fresh))} bpm · con fatiga (km 15+): ${Math.round(wavg(tired))} bpm (${wavg(tired) >= wavg(fresh) ? "+" : ""}${Math.round(wavg(tired) - wavg(fresh))})`);
+  if (decs.length) L.push(`   Desacoplamiento medio (tramos ≥20 min, 4 semanas): ${fmt1(mean(decs))}%`);
+  L.push(`   Km a ritmo maratón en 4 semanas: ${recent.reduce((a, s) => a + s.km, 0).toFixed(1)} km · tramo más largo: ${Math.max(...recent.map(s => s.km), 0).toFixed(1)} km`);
+  if (table) L.push(``, `ℹ️ FC@objetivo = FC × velocidad objetivo / velocidad GAP. Contrastar siempre con calor y sueño del día.`);
+  if (failNote) L.push(failNote);
+  return L.filter(x => x != null);
+}
+
+// ─── Semáforo diario de disposición ──────────────────────────────────────────
+function classifySession(e) {
+  if (!e) return "rest";
+  const name = e.name || "";
+  if (String(e.category || "").toUpperCase().startsWith("RACE")) return "race";
+  if (/(media marat[oó]n|\b10 ?k\b|carrera|\brace\b)/i.test(name) && !/tirada|rodaje|ritmo marat/i.test(name)) return "race";
+  if (/^\W*(media )?marat[oó]n\b/i.test(name)) return "race";
+  if (/weight|strength/i.test(e.type || "") || /fuerza|gym|gimnasio/i.test(name)) return "strength";
+  if (!/run/i.test(e.type || "Run")) return "other";
+  if (/tirada|larga|long/i.test(name) || (e.distance || 0) >= 20000 || (e.moving_time || 0) >= 6000) return "long";
+  if (/fartlek|series|tempo|umbral|interval|cuestas|test|vo2|progresi/i.test(name)) return "quality";
+  if (parseWorkoutText(e.description).some(s => !isRestStep(s) && s.fast != null && s.fast < 270)) return "quality";
+  return "easy";
+}
+const SESSION_RANK = { race: 6, long: 5, quality: 4, easy: 3, strength: 2, other: 1, rest: 0 };
+const SESSION_NAME = { race: "carrera", long: "tirada larga", quality: "calidad", easy: "rodaje", strength: "fuerza", other: "otra", rest: "descanso" };
+const READINESS_ACTIONS = {
+  race:     { green: "Competir según el plan",                          amber: "Salir en el rango lento del objetivo y decidir a mitad de carrera", red: "Rebajar a ritmo maratón o no competir — decide el entrenador" },
+  long:     { green: "Tirada según el plan",                            amber: "Tirada completa en Z2 y bloque a ritmo maratón recortado ~20%",   red: "Posponer la tirada 24-48 h; hoy rodaje corto en Z1 o descanso" },
+  quality:  { green: "Mantener la sesión tal cual",                     amber: "Calidad en el borde lento del rango y ~20% menos de trabajo; si el calentamiento va pesado, rodaje Z2", red: "Cambiar la calidad por rodaje Z1-Z2 de 40-50 min o descanso; mover la calidad 24-48 h" },
+  easy:     { green: "Rodaje según el plan (Z1-Z2)",                    amber: "Rodaje en Z1-Z2 bajo, recortando ~20%",                            red: "Recortar a 30-40 min en Z1 o descansar" },
+  strength: { green: "Fuerza según el plan",                            amber: "Fuerza con cargas −20% y sin llegar al fallo",                     red: "Solo movilidad y fortalecimiento de pie" },
+  other:    { green: "Sesión según el plan",                            amber: "Sesión suave y más corta",                                         red: "Descanso" },
+  rest:     { green: "Descanso previsto",                               amber: "Descanso: prioridad dormir ≥7h 30min",                             red: "Descanso total: prioridad dormir ≥7h 30min" },
+};
+const LEVEL = { green: "🟢 VERDE", amber: "🟠 ÁMBAR", red: "🔴 ROJO" };
+
+function assessReadiness({ d, wl, sessionType, yRpe }) {
+  const w = wl.find(x => x.id === d) || {};
+  const prev = wl.filter(x => x.id < d);
+  const reasons = []; let score = 0;
+  const weekend = [0, 6].includes(dayOfWeek(d));
+  const hrvH = prev.map(x => x.hrv).filter(v => v > 0);
+  const mu = mean(hrvH), sd = stdev(hrvH);
+  if (!w.hrv) reasons.push("sin HRV de hoy (semáforo con datos parciales)");
+  else if (mu != null && sd) {
+    if (w.hrv < mu - 2 * sd) { score += 2; reasons.push(`HRV ${w.hrv} muy por debajo de su rango (${Math.round(mu - sd)}-${Math.round(mu + sd)})`); }
+    else if (w.hrv < mu - sd) { score += weekend ? 0.5 : 1; reasons.push(`HRV ${w.hrv} bajo su rango (${Math.round(mu - sd)}-${Math.round(mu + sd)})${weekend ? " · fin de semana, patrón habitual" : ""}`); }
+    const last7 = wl.filter(x => x.id <= d && x.id > addDays(d, -7)).map(x => x.hrv).filter(v => v > 0);
+    const older = prev.filter(x => x.id <= addDays(d, -7)).map(x => x.hrv).filter(v => v > 0);
+    if (last7.length >= 4 && older.length >= 7) {
+      const m7 = mean(last7), mo = mean(older), so = stdev(older) || sd;
+      if (m7 < mo - 0.5 * so) { score += 1; reasons.push(`HRV media 7 días ${Math.round(m7)} vs ${Math.round(mo)} antes — tendencia a la baja`); }
+    }
+  }
+  const rmu = mean(prev.map(x => x.restingHR).filter(v => v > 0));
+  if (w.restingHR && rmu) {
+    const dv = w.restingHR - rmu;
+    if (dv >= 8) { score += 2; reasons.push(`FC reposo ${w.restingHR} (+${Math.round(dv)} sobre su media)`); }
+    else if (dv >= 5) { score += 1; reasons.push(`FC reposo ${w.restingHR} (+${Math.round(dv)} sobre su media)`); }
+  }
+  if (w.sleepSecs) {
+    const s = w.sleepSecs;
+    const p = s < 21600 ? 1.5 : s < 24300 ? 1 : s < 27000 ? 0.5 : 0;
+    if (p) { score += p; reasons.push(`sueño ${fmtSleep(s)}`); }
+  }
+  const last3 = wl.filter(x => x.id <= d && x.id > addDays(d, -3)).map(x => x.sleepSecs).filter(v => v > 0);
+  if (last3.length >= 3 && mean(last3) < 24300) { score += 0.5; reasons.push(`media de sueño 3 noches ${fmtSleep(mean(last3))}`); }
+  const le = [...wl].reverse().find(x => x.ctl != null && x.id <= d);
+  const tsb = le && le.atl != null ? le.ctl - le.atl : null;
+  if (tsb != null && tsb < -25) { score += 2; reasons.push(`TSB ${fmt1(tsb)}`); }
+  else if (tsb != null && tsb < -18) { score += 1; reasons.push(`TSB ${fmt1(tsb)}`); }
+  if (yRpe >= 9 && ["quality", "long", "race"].includes(sessionType)) { score += 0.5; reasons.push(`RPE ${yRpe}/10 ayer`); }
+  const level = score >= 3 ? "red" : score >= 1.5 ? "amber" : "green";
+  return { level, score, reasons, action: (READINESS_ACTIONS[sessionType] || READINESS_ACTIONS.other)[level] };
+}
+
+
+// ─── MCP Server factory ───────────────────────────────────────────────────────
 function createServer() {
-  const srv = new McpServer({ name: "intervals-mcp", version: "6.5.0" });
+  const srv = new McpServer({ name: "intervals-mcp", version: "7.0.0" });
 
-  srv.tool("get_athlete_profile",
-    "Get full athlete profile: demographics, weight, HR zones, pace zones, FTP, VO2max, thresholds. Dumps all available fields.",
-    {},
-    async () => {
+  srv.tool("get_daily_briefing",
+    "ONE-CALL morning report with a readiness traffic light (green/amber/red + concrete action for today's planned session, from HRV vs range, 7-day HRV trend, resting HR, sleep, TSB and yesterday's RPE), plus today's HRV vs 30-day baseline (mean ± SD), resting HR, sleep (Xh XXmin), CTL/ATL/TSB, ramp rate, today's and tomorrow's planned workouts, last activity, week-to-date km, and automatic alerts. Use this instead of calling wellness+fitness+events+activities separately.",
+    { date: z.string().optional().describe("Fecha YYYY-MM-DD (default: hoy, hora de Madrid)") },
+    async ({ date }) => {
       try {
-        const raw  = await callIntervals(`/athlete/${ATHLETE_ID}`);
-        const d    = raw.athlete || raw;
+        const d = date || today();
+        const wParams = new URLSearchParams({ oldest: addDays(d, -30), newest: d });
+        const [wData, evData, actData] = await Promise.all([
+          callIntervals(`/athlete/${ATHLETE_ID}/wellness?${wParams}`),
+          callIntervals(`/athlete/${ATHLETE_ID}/events?${new URLSearchParams({ oldest: d, newest: addDays(d, 1) })}`),
+          callIntervals(`/athlete/${ATHLETE_ID}/activities?${new URLSearchParams({ oldest: [addDays(d, -14), mondayOf(d)].sort()[0], newest: d })}`),
+        ]);
+        const wl   = toArray(wData, "wellness").sort((a, b) => String(a.id).localeCompare(String(b.id)));
+        const w    = wl.find(x => x.id === d) || {};
+        const prev = wl.filter(x => x.id < d);
+        const hrvHist = prev.map(x => x.hrv).filter(v => v > 0);
+        const rhrHist = prev.map(x => x.restingHR).filter(v => v > 0);
+        const hrvMu = mean(hrvHist), hrvSd = stdev(hrvHist);
+        const rhrMu = mean(rhrHist);
+        const lo = hrvMu != null && hrvSd != null ? hrvMu - hrvSd : null;
+        const hi = hrvMu != null && hrvSd != null ? hrvMu + hrvSd : null;
 
-        const lines = [
-          `👤 PERFIL — ${d.name || d.username || "N/A"}`,
-          d.city      ? `📍 ${d.city}` : null,
-          d.country   ? `🌍 ${d.country}` : null,
-          d.sex       ? `⚧  ${d.sex}` : null,
-          d.dob       ? `🎂 DOB: ${d.dob}` : null,
-          d.weight    ? `⚖️  Peso: ${d.weight} kg` : null,
-          d.height    ? `📐 Altura: ${d.height} cm` : null,
-          ``,
-          `❤️  UMBRALES`,
-          d.maxHR          ? `   FC máxima: ${d.maxHR} bpm` : null,
-          d.restingHR      ? `   FC reposo: ${d.restingHR} bpm` : null,
-          d.lthr           ? `   LTHR: ${d.lthr} bpm` : null,
-          d.ftp            ? `   FTP ciclismo: ${d.ftp} W` : null,
-          d.runningFTP     ? `   FTP running: ${d.runningFTP}` : null,
-          d.swimFTP        ? `   FTP natación: ${d.swimFTP}` : null,
-          d.vo2max         ? `   VO2max: ${d.vo2max}` : null,
-          d.lactateThreshold ? `   Lactato: ${d.lactateThreshold}` : null,
-        ].filter(v => v != null);
+        const loadEntry = [...wl].reverse().find(x => x.ctl != null) || {};
+        const tsb = loadEntry.ctl != null && loadEntry.atl != null ? loadEntry.ctl - loadEntry.atl : null;
 
-        // HR zones
-        const hrZones = d.hrZones || d.heartRateZones || d.zones?.hr || [];
-        if (hrZones.length) {
-          lines.push(`\n📊 ZONAS FC`);
-          hrZones.forEach((z, i) => {
-            const from = z.min || z.from || z.low || "";
-            const to   = z.max || z.to   || z.high || "";
-            lines.push(`   Z${i+1}: ${from}–${to} bpm`);
-          });
+        const alerts = [];
+        const events = toArray(evData, "events");
+        const acts = toArray(actData, "activities").sort((a, b) => String(b.start_date_local).localeCompare(String(a.start_date_local)));
+        const evToday = events.filter(e => (e.start_date_local || "").startsWith(d));
+        const evTom   = events.filter(e => (e.start_date_local || "").startsWith(addDays(d, 1)));
+        const main = evToday.filter(e => !e.category || e.category === "WORKOUT" || String(e.category).startsWith("RACE"))
+          .map(e => ({ e, t: classifySession(e) })).sort((x, y) => SESSION_RANK[y.t] - SESSION_RANK[x.t])[0];
+        const sessionType = main ? main.t : "rest";
+        const yRpe = Math.max(0, ...acts.filter(a => actDate(a) === addDays(d, -1)).map(a => firstDefined(a.icu_rpe, a.perceived_exertion) || 0));
+        const rd = assessReadiness({ d, wl, sessionType, yRpe });
+        const L = [`☀️ INFORME — ${d}`, ``,
+          `🚦 SEMÁFORO: ${LEVEL[rd.level]} (${rd.score.toFixed(1)} pts) — ${rd.action}`,
+          `   Sesión: ${SESSION_NAME[sessionType]}${main ? ` (${main.e.name})` : ""}`,
+          `   ${rd.reasons.length ? `Motivos: ${rd.reasons.join(" · ")}` : "Todo dentro de rango"}`,
+          ``, `💓 RECUPERACIÓN`];
+        if (w.hrv) {
+          const status = lo == null ? "" : w.hrv < lo ? " 🔴 POR DEBAJO del baseline" : w.hrv > hi ? " 🟢 por encima del baseline" : " 🟢 dentro del baseline";
+          L.push(`   HRV: ${w.hrv}${status}`);
+          if (lo != null && w.hrv < lo) alerts.push(`HRV ${w.hrv} por debajo del límite inferior (${Math.round(lo)})`);
+        } else L.push(`   HRV: sin dato todavía (¿reloj sincronizado?)`);
+        if (hrvMu != null) L.push(`   Baseline 30d: ${Math.round(hrvMu)} ± ${Math.round(hrvSd || 0)} (intervalo ${Math.round(lo)}–${Math.round(hi)}, n=${hrvHist.length})`);
+        if (w.restingHR) {
+          L.push(`   FC reposo: ${w.restingHR} bpm${rhrMu ? ` (media 30d ${Math.round(rhrMu)})` : ""}`);
+          if (rhrMu && w.restingHR >= rhrMu + 5) alerts.push(`FC reposo ${w.restingHR} bpm, +${Math.round(w.restingHR - rhrMu)} sobre su media`);
+        }
+        if (w.sleepSecs) {
+          L.push(`   Sueño: ${fmtSleep(w.sleepSecs)}${w.sleepScore ? ` · score ${w.sleepScore}/100` : ""}`);
+          if (w.sleepSecs < 27000) alerts.push(`Sueño ${fmtSleep(w.sleepSecs)} (< 7h 30min)`);
+        }
+        const nights = prev.slice(-6).concat(w.sleepSecs ? [w] : []).filter(x => x.sleepSecs);
+        if (nights.length >= 3) {
+          const ok = nights.filter(x => x.sleepSecs >= 27000).length;
+          L.push(`   Noches ≥7h 30min (últimos 7 días): ${ok}/${nights.length}`);
+        }
+        ["fatigue","soreness","mood","motivation"].forEach(k => { if (w[k] != null) L.push(`   ${k}: ${w[k]}`); });
+        const vo2Hist = wl.filter(x => x.vo2max > 0);
+        if (vo2Hist.length) {
+          const vNow = vo2Hist[vo2Hist.length - 1], vOld = vo2Hist[0];
+          const diff = vNow.vo2max - vOld.vo2max;
+          L.push(`   VO2max (Garmin): ${vNow.vo2max}${vNow.id !== d ? ` (dato del ${vNow.id})` : ""}${vo2Hist.length > 1 && vOld.id !== vNow.id ? ` · ${diff > 0 ? "+" : ""}${diff} desde ${vOld.id}` : ""}`);
         }
 
-        // Pace zones
-        const paceZones = d.paceZones || d.zones?.pace || [];
-        if (paceZones.length) {
-          lines.push(`\n🏃 ZONAS RITMO`);
-          paceZones.forEach((z, i) => {
-            lines.push(`   Z${i+1}: ${z.min || z.from || ""} – ${z.max || z.to || ""} min/km`);
-          });
+        L.push(``, `📊 CARGA`);
+        if (loadEntry.ctl != null) {
+          L.push(`   CTL ${fmt1(loadEntry.ctl)} · ATL ${fmt1(loadEntry.atl)} · TSB ${fmt1(tsb)} ${tsb > 5 ? "🟢" : tsb > -10 ? "🟡" : tsb > -25 ? "🟠" : "🔴"}`);
+          if (loadEntry.rampRate != null) L.push(`   Ramp rate: ${Number(loadEntry.rampRate).toFixed(2)}/semana`);
+          if (tsb != null && tsb < -25) alerts.push(`TSB ${fmt1(tsb)} (< -25)`);
+          if (loadEntry.rampRate != null && loadEntry.rampRate > 7) alerts.push(`Ramp rate ${Number(loadEntry.rampRate).toFixed(1)} (> 7/semana)`);
+        } else L.push(`   Sin datos de carga`);
+
+        const evLine = (e) => `   • ${e.name || "Evento"} (${e.type || e.category || "?"})${e.moving_time ? ` · ${fmtDuration(e.moving_time)}` : ""}${e.distance ? ` · ${(e.distance/1000).toFixed(1)} km` : ""} [ID:${e.id}]${e.description ? `\n${e.description.split("\n").map(x => `     ${x}`).join("\n")}` : ""}`;
+        L.push(``, `📅 HOY`);
+        L.push(evToday.length ? evToday.map(evLine).join("\n") : `   Sin entrenamiento planificado`);
+        L.push(`📅 MAÑANA`);
+        L.push(evTom.length ? evTom.map(e => `   • ${e.name || "Evento"} (${e.type || e.category || "?"})`).join("\n") : `   Sin entrenamiento planificado`);
+
+        const last = acts.find(a => (a.start_date_local || "") < `${d}T23:59:59`);
+        if (last) {
+          const dec = firstDefined(last.decoupling, last.icu_decoupling);
+          const rpe = firstDefined(last.icu_rpe, last.perceived_exertion);
+          const lastDate = (last.start_date_local||"").split("T")[0];
+          const gap = Math.round((new Date(`${d}T12:00:00Z`) - new Date(`${lastDate}T12:00:00Z`)) / 86400000);
+          L.push(``, `🏃 ÚLTIMA ACTIVIDAD — ${lastDate}${gap >= 3 ? ` (hace ${gap} días — ¿falta sincronizar?)` : ""} [ID:${last.id}]`);
+          L.push(`   ${last.name || last.type}: ${last.distance ? (last.distance/1000).toFixed(2) + " km · " : ""}${fmtDuration(last.moving_time)}${last.average_speed ? " · " + fmtPace(last.average_speed) : ""}${last.average_heartrate ? " · " + fmt0(last.average_heartrate) + " bpm" : ""}`);
+          const extra = [
+            firstDefined(last.icu_training_load, last.tss) != null ? `carga ${fmt0(firstDefined(last.icu_training_load, last.tss))}` : null,
+            dec != null ? `desacoplamiento ${fmt1(dec)}%` : null,
+            rpe != null ? `RPE ${rpe}/10` : `⚠️ sin RPE registrado`,
+          ].filter(Boolean);
+          L.push(`   ${extra.join(" · ")}`);
         }
 
-        // Power zones
-        const pwrZones = d.powerZones || d.zones?.power || [];
-        if (pwrZones.length) {
-          lines.push(`\n⚡ ZONAS POTENCIA`);
-          pwrZones.forEach((z, i) => {
-            lines.push(`   Z${i+1}: ${z.min || z.from || ""}–${z.max || z.to || ""} W`);
-          });
-        }
+        const monday = mondayOf(d);
+        const week = acts.filter(a => (a.start_date_local || "") >= monday && /run/i.test(a.type || ""));
+        const weekKm = week.reduce((x, a) => x + (a.distance || 0), 0) / 1000;
+        L.push(``, `📆 SEMANA (desde ${monday}): ${weekKm.toFixed(1)} km en ${week.length} sesiones de carrera`);
 
-        // Dump any extra unknown keys for debugging
-        const knownKeys = new Set(["name","username","city","country","sex","dob","weight","height","maxHR","restingHR","lthr","ftp","runningFTP","swimFTP","vo2max","lactateThreshold","hrZones","heartRateZones","paceZones","powerZones","zones","athlete","id"]);
-        const extras = Object.entries(d).filter(([k,v]) => !knownKeys.has(k) && v != null && typeof v !== "object");
-        if (extras.length) {
-          lines.push(`\n📋 OTROS CAMPOS`);
-          extras.forEach(([k,v]) => lines.push(`   ${k}: ${v}`));
-        }
-
-        return { content: [{ type: "text", text: lines.join("\n") }] };
+        L.push(``, alerts.length ? `🚨 ALERTAS\n${alerts.map(x => `   • ${x}`).join("\n")}` : `✅ Sin alertas`);
+        return { content: [{ type: "text", text: L.join("\n") }] };
       } catch (err) {
-        return { content: [{ type: "text", text: `❌ get_athlete_profile: ${err.message}` }] };
+        return { content: [{ type: "text", text: `❌ get_daily_briefing: ${err.message}` }] };
       }
     }
   );
 
-  srv.tool("get_athlete_settings",
-    "Get athlete sport settings: HR zones, pace zones, power zones, FTP, thresholds per sport type.",
-    {},
-    async () => {
+  srv.tool("get_post_workout_report",
+    "ONE-CALL post-workout analysis (default: latest activity). Returns metrics, GAP, planned-vs-done, HR zones, rep-by-rep compliance against the planned workout's pace targets, marathon-pace block (auto-detected, or from_km/to_km) with HR@4:16 and decoupling, whole-run decoupling, compact km splits, RPE/feel/notes.",
+    {
+      activity_id: z.string().optional().describe("ID de la actividad (default: la última registrada)"),
+      mp_from_km:  z.number().optional().describe("Inicio del bloque a ritmo maratón en km (si no, se detecta solo)"),
+      mp_to_km:    z.number().optional().describe("Fin del bloque a ritmo maratón en km"),
+      splits:      z.boolean().optional().describe("Incluir splits por km (default: true)"),
+    },
+    async ({ activity_id, mp_from_km, mp_to_km, splits = true }) => {
       try {
-        // Try different endpoints for settings/zones
-        let data;
-        try {
-          data = await callIntervals(`/athlete/${ATHLETE_ID}/config`);
-        } catch (_) {
-          try {
-            data = await callIntervals(`/athlete/${ATHLETE_ID}/sports-settings`);
-          } catch (_) {
-            data = await callIntervals(`/athlete/${ATHLETE_ID}`);
+        let id = activity_id;
+        if (!id) {
+          const acts = await listActivities(daysAgo(10), today());
+          if (!acts.length) return { content: [{ type: "text", text: "No hay actividades en los últimos 10 días." }] };
+          id = String(acts[acts.length - 1].id);
+        }
+        const a = await fetchActivity(id);
+        if (!a || !a.id) return { content: [{ type: "text", text: `⚠️ Actividad ${id} no encontrada.` }] };
+        const day = actDate(a);
+        const run = isRun(a);
+        const [evData, st, ivRaw, u] = await Promise.all([
+          callIntervals(`/athlete/${ATHLETE_ID}/events?${new URLSearchParams({ oldest: day, newest: day })}`).catch(() => []),
+          run ? fetchStreams(a.id).catch(() => null) : null,
+          fetchIntervals(a.id).catch(() => null),
+          getHrZoneUpper(),
+        ]);
+        const sp = firstDefined(a.average_speed, a.averageSpeed);
+        const gap = firstDefined(a.gap, a.icu_gap);
+        const load = firstDefined(a.icu_training_load, a.tss);
+        const rpe = firstDefined(a.icu_rpe, a.perceived_exertion);
+        const temp = firstDefined(a.average_weather_temp, a.average_temp);
+        const FEEL = { 1: "muy fuerte", 2: "fuerte", 3: "normal", 4: "flojo", 5: "muy flojo" };
+
+        const L = [`🏃 ${dayLabel(day)} (${day}) — ${a.name || a.type} [ID:${a.id}]`];
+        L.push(`   ${((a.distance || 0) / 1000).toFixed(2)} km · ${fmtDuration(a.moving_time)}${sp ? ` · ${pS(sp)}/km` : ""}${gap ? ` (GAP ${pS(gap)})` : ""}` +
+          `${a.average_heartrate ? ` · FC ${fmt0(a.average_heartrate)}/${fmt0(a.max_heartrate)}` : ""}${a.average_cadence ? ` · cad ${fmt0(a.average_cadence)}` : ""}` +
+          `${load != null ? ` · carga ${fmt0(load)}` : ""}${temp != null ? ` · ${fmt0(temp)}°C` : ""}`);
+
+        // Plan vs hecho
+        const ev = pairedEvent(a, toArray(evData, "events"));
+        const steps = ev ? parseWorkoutText(ev.description) : [];
+        if (ev) {
+          const pk = plannedKm(ev);
+          L.push(`📋 Plan: ${ev.name}${pk ? ` · ${pk.toFixed(1)} km → hecho ${((a.distance || 0) / 1000).toFixed(1)} km (${Math.round((a.distance || 0) / 10 / pk)}%)` : ""}`);
+        } else L.push(`📋 Sin entrenamiento planificado emparejado`);
+
+        // Zonas
+        let zt = a.icu_hr_zone_times || a.icu_zone_times || [];
+        if (!zt.length && st?.hr.length) { zt = new Array(u.length).fill(0); st.hr.forEach(h => { if (h > 0) zt[zoneOf(h, u)]++; }); }
+        if (zt.length) {
+          const tot = zt.slice(0, u.length).reduce((x, y) => x + (y || 0), 0) || 1;
+          const zn = zoneNames(u.length);
+          L.push(`❤️ Zonas: ${zt.slice(0, u.length).map((s, i) => [zn[i], Math.round((s || 0) / tot * 100)]).filter(([, p]) => p > 0).map(([n, p]) => `${n} ${p}%`).join(" · ")}`);
+        }
+
+        // Cumplimiento repetición a repetición
+        let hasCompliance = false;
+        if (steps.length && ivRaw?.icu_intervals?.length) {
+          const c = repCompliance(ivRaw.icu_intervals, steps);
+          if (c && new Set(c.rows.map(r => `${r.st.fast}-${r.st.slow}`)).size === 1 && c.rows.length === 1) { /* rodaje de un solo paso: sin tabla */ }
+          else if (c) {
+            hasCompliance = true;
+            L.push(`🎯 Cumplimiento (${c.mode}): ${complianceSummary(c)}`);
+            if (c.rows.length > 1) c.rows.slice(0, 30).forEach(r => L.push(`   ${String(r.n).padStart(2)} ${r.km.toFixed(2)}km ${fmtSecs(r.secs)} → ${fmtSecs(r.pace)} (obj ${fmtSecs(r.st.fast)}-${fmtSecs(r.st.slow)}) FC ${r.hr ? Math.round(r.hr) : "-"}/${r.max ? Math.round(r.max) : "-"} ${r.status}`));
           }
         }
 
-        if (!data || typeof data !== "object") {
-          return { content: [{ type: "text", text: "No settings data available." }] };
+        // Bloque a ritmo maratón + desacoplamiento global
+        if (run && st && st.hr.length) {
+          const gv = gapVelocity(st.vel, st.dist, st.alt);
+          const band = mpBand();
+          let seg = null;
+          if (mp_from_km != null && mp_to_km != null) {
+            const idx = []; st.dist.forEach((dd, i) => { if (dd >= mp_from_km * 1000 && dd <= mp_to_km * 1000) idx.push(i); });
+            const m = idx.length > 60 ? segMetrics(st, gv, idx[0], idx[idx.length - 1]) : null;
+            if (m && m.hr) {
+              const dec = computeDecoupling(st, mp_from_km * 1000, mp_to_km * 1000);
+              seg = { ...m, pace: 1000 / m.v, gap: 1000 / m.vg, hrNorm: m.hr * (band.vT / m.vg), dec: dec ? dec.decoupling : m.dec };
+            }
+          } else {
+            const r = await mpSegmentsFor(a, band);
+            seg = r.segs.sort((x, y) => y.km - x.km)[0] || null;
+          }
+          if (seg) {
+            const dr = seg.dec == null ? "" : seg.dec < 5 ? " 🟢" : seg.dec < 8 ? " 🟡" : " 🔴";
+            L.push(`🎯 Bloque MP: km ${seg.startKm.toFixed(1)}-${(seg.endKm ?? seg.startKm + seg.km).toFixed(1)} (${seg.km.toFixed(1)} km) · ${fmtSecs(seg.pace)} (GAP ${fmtSecs(seg.gap)}) · FC ${Math.round(seg.hr)} · FC@4:16 ${Math.round(seg.hrNorm)}` +
+              `${seg.dec != null ? ` · desac ${fmt1(seg.dec)}%${dr}` : " · desac: tramo <20 min"}`);
+          }
+          const whole = !seg && !hasCompliance ? computeDecoupling(st) : null;
+          if (whole) L.push(`🫀 Desacoplamiento global: ${fmt1(whole.decoupling)}% ${whole.decoupling < 5 ? "🟢" : whole.decoupling < 8 ? "🟡" : "🔴"} (1ª mitad ${whole.first.pace.replace(" min/km", "")} @ ${whole.first.hr} · 2ª ${whole.second.pace.replace(" min/km", "")} @ ${whole.second.hr})`);
+
+          if (splits && st.dist.length) {
+            const n = Math.ceil((st.dist[st.dist.length - 1] || 0) / 1000);
+            const b = Array.from({ length: n }, () => ({ v: [], h: [] }));
+            for (let i = 0; i < st.dist.length; i++) {
+              const k = Math.min(Math.floor((st.dist[i] || 0) / 1000), n - 1);
+              if (k < 0) continue;
+              if (st.vel[i] > 0) b[k].v.push(st.vel[i]);
+              if (st.hr[i] > 0) b[k].h.push(st.hr[i]);
+            }
+            const cells = b.map((x, k) => x.v.length ? `${k + 1} ${pS(mean(x.v))}/${x.h.length ? Math.round(mean(x.h)) : "-"}` : null).filter(Boolean);
+            L.push(`📊 Splits (km ritmo/FC):`);
+            for (let i = 0; i < cells.length; i += 6) L.push(`   ${cells.slice(i, i + 6).join(" · ")}`);
+          }
         }
 
-        const d = data.athlete || data;
-        const lines = [`⚙️ CONFIGURACIÓN DEL ATLETA\n`];
-
-        // HR zones
-        const hrZones = d.hrZones || d.heartRateZones || d.hr_zones || [];
-        if (hrZones.length) {
-          lines.push(`❤️  ZONAS FC`);
-          hrZones.forEach((z, i) => {
-            const from = z.min ?? z.from ?? z.low ?? "";
-            const to   = z.max ?? z.to   ?? z.high ?? "";
-            const name = z.name || z.label || `Z${i+1}`;
-            lines.push(`   ${name}: ${from}–${to} bpm`);
-          });
-          lines.push("");
-        }
-
-        // Pace zones
-        const paceZones = d.paceZones || d.pace_zones || [];
-        if (paceZones.length) {
-          lines.push(`🏃 ZONAS RITMO`);
-          paceZones.forEach((z, i) => {
-            lines.push(`   Z${i+1}: ${z.min || z.from || ""}–${z.max || z.to || ""} min/km`);
-          });
-          lines.push("");
-        }
-
-        // FTP / thresholds
-        if (d.ftp || d.lthr || d.runningFTP || d.maxHR) {
-          lines.push(`📊 UMBRALES`);
-          if (d.maxHR)      lines.push(`   FC máxima: ${d.maxHR} bpm`);
-          if (d.lthr)       lines.push(`   LTHR: ${d.lthr} bpm`);
-          if (d.ftp)        lines.push(`   FTP ciclismo: ${d.ftp} W`);
-          if (d.runningFTP) lines.push(`   FTP running: ${d.runningFTP}`);
-        }
-
-        if (lines.length <= 2) {
-          lines.push(`Campos disponibles: ${Object.keys(d).join(", ")}`);
-        }
-
-        return { content: [{ type: "text", text: lines.join("\n") }] };
+        // Diario
+        const diary = [rpe != null ? `RPE ${rpe}/10` : null, a.feel != null ? `sensaciones ${FEEL[a.feel] || a.feel}` : null].filter(Boolean);
+        L.push(diary.length ? `😓 ${diary.join(" · ")}` : `⚠️ Sin RPE ni sensaciones → registrarlos con update_activity`);
+        if (a.description) L.push(`📝 ${a.description}`);
+        return { content: [{ type: "text", text: L.join("\n") }] };
       } catch (err) {
-        return { content: [{ type: "text", text: `❌ get_athlete_settings: ${err.message}` }] };
+        return { content: [{ type: "text", text: `❌ get_post_workout_report: ${err.message}` }] };
+      }
+    }
+  );
+
+  srv.tool("get_weekly_review",
+    "ONE-CALL Sunday review of a Monday–Sunday week: planned vs done day by day, km/load vs the previous 4 weeks (% change), HRV/sleep/resting-HR vs 30-day baseline, CTL/ATL/TSB change, key sessions (rep compliance, marathon-pace blocks with HR@4:16 and decoupling), missing RPE, next week's plan status, race countdown and the marathon-pace trend summary. Replaces ~9 separate calls.",
+    {
+      week_start: z.string().optional().describe("Lunes YYYY-MM-DD (default: semana en curso si hoy es sábado o domingo; si no, la anterior)"),
+      include_mp_trend: z.boolean().optional().describe("Añadir el resumen de get_mp_trend (default: true)"),
+    },
+    async ({ week_start, include_mp_trend = true }) => {
+      try {
+        const d = today();
+        const mon = week_start ? mondayOf(week_start) : ([0, 6].includes(dayOfWeek(d)) ? mondayOf(d) : addDays(mondayOf(d), -7));
+        const sun = addDays(mon, 6);
+        const [acts, evData, wData] = await Promise.all([
+          listActivities(addDays(mon, -28), sun),
+          callIntervals(`/athlete/${ATHLETE_ID}/events?${new URLSearchParams({ oldest: mon, newest: addDays(sun, 7) })}`),
+          callIntervals(`/athlete/${ATHLETE_ID}/wellness?${new URLSearchParams({ oldest: addDays(mon, -31), newest: sun })}`),
+        ]);
+        const events = toArray(evData, "events").filter(e => !e.category || e.category === "WORKOUT" || String(e.category).startsWith("RACE"));
+        const wl = toArray(wData, "wellness").sort((a, b) => String(a.id).localeCompare(String(b.id)));
+        const inWeek = (ds, m) => ds >= m && ds <= addDays(m, 6);
+        const alerts = [];
+
+        // Volumen: esta semana y las 4 anteriores
+        const weeks = [0, 1, 2, 3, 4].map(k => {
+          const m = addDays(mon, -7 * k);
+          const wa = acts.filter(a => inWeek(actDate(a), m));
+          const runs = wa.filter(isRun);
+          return { m, km: runs.reduce((s, a) => s + (a.distance || 0), 0) / 1000, runs: runs.length,
+                   ld: wa.reduce((s, a) => s + (firstDefined(a.icu_training_load, a.tss) || 0), 0), secs: wa.reduce((s, a) => s + (a.moving_time || 0), 0) };
+        });
+        const cw = weeks[0], pw = weeks[1], avg3 = mean(weeks.slice(1, 4).map(w => w.km));
+        const pct = (x, y) => y > 0 ? `${x >= y ? "+" : ""}${Math.round((x / y - 1) * 100)}%` : "—";
+        const L = [`📋 REVISIÓN SEMANAL ${mon} → ${sun}`, ``,
+          `📏 VOLUMEN: ${cw.km.toFixed(1)} km en ${cw.runs} carreras · ${fmtDuration(cw.secs)} · carga ${fmt0(cw.ld)} (${(cw.km ? cw.ld / cw.km : 0).toFixed(1)} TSS/km)`,
+          `   vs semana anterior (${pw.km.toFixed(1)} km): ${pct(cw.km, pw.km)} · vs media 3 semanas previas (${avg3.toFixed(1)} km): ${pct(cw.km, avg3)}`,
+          `   Últimas semanas: ${weeks.slice().reverse().map(w => `${w.m.slice(5)} ${w.km.toFixed(0)}`).join(" · ")} km`];
+        if (avg3 > 0 && cw.km > avg3 * 1.2) alerts.push(`volumen ${pct(cw.km, avg3)} sobre la tendencia (guía ~15%; no aplica al rebote tras semana de carrera)`);
+
+        // Día a día: plan vs hecho
+        L.push(``, `📅 PLAN vs HECHO`);
+        let plKm = 0, noKm = 0;
+        const weekActs = acts.filter(a => inWeek(actDate(a), mon));
+        for (let i = 0; i < 7; i++) {
+          const day = addDays(mon, i);
+          const pl = events.filter(e => (e.start_date_local || "").startsWith(day));
+          const dn = weekActs.filter(a => actDate(a) === day);
+          pl.forEach(e => { if (/run/i.test(e.type || "Run")) { const pk = plannedKm(e); if (pk) plKm += pk; else noKm++; } });
+          if (!pl.length && !dn.length) { L.push(`   ${dayLabel(day)} · descanso`); continue; }
+          const used = new Set();
+          const parts = pl.map(e => {
+            const a = dn.find(x => !used.has(x.id) && pairedEvent(x, [e]) === e);
+            if (a) used.add(a.id);
+            const pk = plannedKm(e);
+            if (!a) return `${e.name}${pk ? ` (${pk.toFixed(0)} km)` : ""} → ${day < d ? "❌ no hecho" : "pendiente"}`;
+            const r = pk && isRun(a) ? (a.distance || 0) / 1000 / pk : null;
+            const mark = r == null ? "✅" : r >= 0.9 ? "✅" : r >= 0.7 ? "🟡" : "🟠";
+            return `${e.name}${pk ? ` (${pk.toFixed(0)})` : ""} → ${isRun(a) ? `${((a.distance || 0) / 1000).toFixed(1)} km ${pS(a.average_speed)} FC ${fmt0(a.average_heartrate)}` : fmtDuration(a.moving_time)}` +
+              `${firstDefined(a.icu_rpe, a.perceived_exertion) != null ? ` RPE ${firstDefined(a.icu_rpe, a.perceived_exertion)}` : ""} ${mark}`;
+          });
+          dn.filter(a => !used.has(a.id)).forEach(a => parts.push(`➕ ${a.name || a.type} ${isRun(a) ? `${((a.distance || 0) / 1000).toFixed(1)} km ${pS(a.average_speed)}` : fmtDuration(a.moving_time)}`));
+          L.push(`   ${dayLabel(day)} · ${parts.join(" | ")}`);
+        }
+        if (plKm > 0) L.push(`   Planificado: ${plKm.toFixed(1)} km${noKm ? ` + ${noKm} sesión(es) por tiempo` : ""} · hecho: ${cw.km.toFixed(1)} km`);
+
+        // Sesiones clave: cumplimiento por repetición y bloques a ritmo maratón
+        const band = mpBand();
+        const runs = weekActs.filter(isRun);
+        const keyLines = [];
+        for (let i = 0; i < runs.length; i += 3) {
+          const res = await Promise.all(runs.slice(i, i + 3).map(async (a) => {
+            const out = [];
+            const ev = pairedEvent(a, events);
+            const steps = ev ? parseWorkoutText(ev.description) : [];
+            if (steps.some(s => !isRestStep(s) && s.fast != null && s.fast < 270)) {
+              const iv = await fetchIntervals(a.id).catch(() => null);
+              const c = iv?.icu_intervals ? repCompliance(iv.icu_intervals, steps) : null;
+              if (c) out.push(`${dayLabel(actDate(a))} · ${ev.name}: ${complianceSummary(c)}`);
+            }
+            if ((a.average_speed || 0) === 0 || a.average_speed > band.vLo * 0.75) {
+              const r = await mpSegmentsFor(a, band).catch(() => ({ segs: [] }));
+              r.segs.filter(s => s.km >= 3).forEach(s => out.push(`${dayLabel(actDate(a))} · MP km ${s.startKm.toFixed(1)}-${(s.endKm ?? s.startKm + s.km).toFixed(1)} (${s.km.toFixed(1)} km) ${fmtSecs(s.pace)} · FC ${Math.round(s.hr)} · FC@4:16 ${Math.round(s.hrNorm)}${s.dec != null ? ` · desac ${fmt1(s.dec)}% ${s.dec < 5 ? "🟢" : s.dec < 8 ? "🟡" : "🔴"}` : ""}`));
+            }
+            return out;
+          }));
+          res.forEach(r => keyLines.push(...r));
+        }
+        if (keyLines.length) L.push(``, `🎯 SESIONES CLAVE`, ...keyLines.map(x => `   ${x}`));
+        const noRpe = runs.filter(a => firstDefined(a.icu_rpe, a.perceived_exertion) == null);
+        if (noRpe.length) alerts.push(`sin RPE: ${noRpe.map(a => dayLabel(actDate(a))).join(", ")}`);
+
+        // Recuperación
+        const base = wl.filter(x => x.id < mon && x.id >= addDays(mon, -30));
+        const wk = wl.filter(x => inWeek(x.id, mon));
+        const bh = base.map(x => x.hrv).filter(v => v > 0), mu = mean(bh), sd = stdev(bh);
+        const wh = wk.map(x => x.hrv).filter(v => v > 0);
+        const sl = wk.map(x => x.sleepSecs).filter(v => v > 0);
+        const rb = mean(base.map(x => x.restingHR).filter(v => v > 0)), rw = mean(wk.map(x => x.restingHR).filter(v => v > 0));
+        L.push(``, `💓 RECUPERACIÓN`);
+        if (wh.length && mu != null) {
+          const low = sd ? wh.filter(v => v < mu - sd).length : 0;
+          L.push(`   HRV media ${Math.round(mean(wh))} vs baseline ${Math.round(mu)} ± ${Math.round(sd || 0)} · ${low} día(s) bajo el rango · valores: ${wk.map(x => x.hrv || "-").join(" ")}`);
+          if (low >= 3) alerts.push(`${low} días con HRV bajo el rango`);
+        }
+        if (sl.length) {
+          const ok = sl.filter(s => s >= 27000).length;
+          L.push(`   Sueño medio ${fmtSleep(mean(sl))} · noches ≥7h 30min: ${ok}/${sl.length}`);
+          if (ok < 5 && sl.length >= 6) alerts.push(`solo ${ok} noches ≥7h 30min (objetivo 5/7)`);
+        }
+        if (rw) L.push(`   FC reposo media ${Math.round(rw)}${rb ? ` (baseline ${Math.round(rb)})` : ""}`);
+
+        // Carga
+        const lStart = [...wl].reverse().find(x => x.ctl != null && x.id < mon);
+        const lEnd = [...wl].reverse().find(x => x.ctl != null && x.id <= sun);
+        if (lEnd) {
+          const tsb = lEnd.ctl - lEnd.atl;
+          L.push(``, `📈 CARGA: CTL ${lStart ? `${fmt1(lStart.ctl)} → ` : ""}${fmt1(lEnd.ctl)}${lStart ? ` (${lEnd.ctl >= lStart.ctl ? "+" : ""}${fmt1(lEnd.ctl - lStart.ctl)})` : ""} · ATL ${fmt1(lEnd.atl)} · TSB ${fmt1(tsb)}${lEnd.rampRate != null ? ` · ramp ${Number(lEnd.rampRate).toFixed(1)}` : ""} (${lEnd.id})`);
+          if (tsb < -25) alerts.push(`TSB ${fmt1(tsb)}`);
+        }
+
+        // Semana siguiente y cuenta atrás
+        const nx = events.filter(e => { const ds = (e.start_date_local || "").split("T")[0]; return ds > sun && ds <= addDays(sun, 7); });
+        const nxKm = nx.filter(e => /run/i.test(e.type || "Run")).reduce((s, e) => s + (plannedKm(e) || 0), 0);
+        const toRace = Math.round((new Date(`${RACE_DATE}T12:00:00Z`) - new Date(`${d}T12:00:00Z`)) / 86400000);
+        L.push(``, `🗓️ SIGUIENTE SEMANA: ${nx.length ? `${nx.length} sesiones planificadas · ${nxKm.toFixed(0)} km` : "sin planificar"}${toRace > 0 ? ` · Valencia en ${toRace} días (${Math.floor(toRace / 7)} sem ${toRace % 7} d)` : ""}`);
+
+        if (include_mp_trend) {
+          const r = await computeMpTrend();
+          if (!r.error) L.push(``, ...mpTrendLines(r, { table: false }));
+        }
+        L.push(``, alerts.length ? `🚨 ALERTAS\n${alerts.map(x => `   • ${x}`).join("\n")}` : `✅ Sin alertas`);
+        return { content: [{ type: "text", text: L.join("\n") }] };
+      } catch (err) {
+        return { content: [{ type: "text", text: `❌ get_weekly_review: ${err.message}` }] };
+      }
+    }
+  );
+
+  srv.tool("get_athlete",
+    "Athlete profile + running settings in one call: weight/age, LTHR, max HR, Critical Speed, D', configured HR zones, pace zones derived from CS, and gear (optional).",
+    { include_gear: z.boolean().optional().describe("Incluir material/zapatillas (default: false)") },
+    async ({ include_gear = false }) => {
+      try {
+        const [raw, cfg, gearData] = await Promise.all([
+          callIntervals(`/athlete/${ATHLETE_ID}`),
+          getRunConfig(true),
+          include_gear ? callIntervals(`/athlete/${ATHLETE_ID}/gear`).catch(() => []) : null,
+        ]);
+        const p = raw.athlete || raw;
+        const L = [`👤 ${p.name || p.username || "Atleta"}${p.sex ? ` · ${p.sex}` : ""}${p.dob ? ` · nacido ${p.dob}` : ""}${p.weight || p.icu_weight ? ` · ${p.weight || p.icu_weight} kg` : ""}${p.city ? ` · ${p.city}` : ""}`];
+        if (!cfg) L.push(`⚠️ No hay configuración de carrera (Run) en intervals.`);
+        else {
+          const csMps = cfg.threshold_pace ? parseFloat(cfg.threshold_pace) : null;
+          const csSecs = csMps ? (csMps < 20 ? 1000 / csMps : csMps) : null;
+          L.push(`🎯 LTHR ${cfg.lthr ?? "?"} · FC máx ${cfg.max_hr ?? "?"}${csSecs ? ` · CS ${fmtSecs(csSecs)}/km` : ""}${cfg.w_prime ? ` · D' ${cfg.w_prime} m` : ""}`);
+          if (Array.isArray(cfg.hr_zones) && cfg.hr_zones.length) L.push(`❤️ Zonas FC: ${zoneLabels(cfg.hr_zones.map(Number)).join(" · ")}`);
+          if (csSecs) {
+            const Z = [["Z1", 0, 77.5], ["Z2", 78.5, 87.7], ["Z3", 88.7, 94.3], ["Z4", 95.3, 100], ["Z5a", 101, 103.4], ["Z5b", 104.4, 111.5], ["Z5c", 112.5, 999]];
+            L.push(`🏃 Zonas ritmo: ${Z.map(([n, lo, hi]) => lo === 0 ? `${n} >${fmtSecs(csSecs / (hi / 100))}` : hi >= 999 ? `${n} <${fmtSecs(csSecs / (lo / 100))}` : `${n} ${fmtSecs(csSecs / (hi / 100))}-${fmtSecs(csSecs / (lo / 100))}`).join(" · ")}`);
+          }
+        }
+        if (include_gear) {
+          const gear = toArray(gearData, "gear").filter(g => !g.retired).sort((a, b) => (b.distance || 0) - (a.distance || 0));
+          L.push(gear.length ? `👟 Material: ${gear.map(g => `${g.name} ${fmt0((g.distance || 0) / 1000)} km`).join(" · ")}` : `👟 Sin material en intervals (Garmin no lo envía)`);
+        }
+        return { content: [{ type: "text", text: L.join("\n") }] };
+      } catch (err) {
+        return { content: [{ type: "text", text: `❌ get_athlete: ${err.message}` }] };
       }
     }
   );
 
   srv.tool("get_activities",
-    "Get recent activities: distance, pace, HR, power, TSS, calories. Returns IDs for get_activity_detail.",
+    "List activities (distance, pace, HR, load, RPE, IDs) — or, with by_week, weekly totals (km, sessions, time, load) Monday–Sunday.",
     {
-      oldest: z.string().optional().describe("Start date YYYY-MM-DD (default: 30 days ago)"),
-      newest: z.string().optional().describe("End date YYYY-MM-DD (default: today)"),
-      limit:  z.number().optional().describe("Max results (default: 20)"),
+      oldest:  z.string().optional().describe("YYYY-MM-DD (default: hace 30 días)"),
+      newest:  z.string().optional().describe("YYYY-MM-DD (default: hoy)"),
+      limit:   z.number().optional().describe("Máximo de actividades (default: 20)"),
+      by_week: z.boolean().optional().describe("Totales por semana lunes-domingo en lugar de la lista"),
+      weeks:   z.number().optional().describe("Con by_week: semanas hacia atrás (default: 8, máx: 26)"),
     },
-    async ({ oldest, newest, limit = 20 }) => {
+    async ({ oldest, newest, limit = 20, by_week = false, weeks = 8 }) => {
       try {
-        const range  = safeRange(oldest || daysAgo(30), newest, 60);
-        const params = new URLSearchParams({ oldest: range.oldest, newest: range.newest });
-        const data   = await callIntervals(`/athlete/${ATHLETE_ID}/activities?${params}`);
-        const acts   = toArray(data, "activities").slice(0, limit);
-        if (!acts.length) return { content: [{ type: "text", text: `No activities found (${range.oldest} → ${range.newest}).` }] };
-        const lines = acts.map(a => [
-          `📅 ${(a.start_date_local || a.date || "").split("T")[0]} — ${a.name || "Activity"} (${a.type || "?"})${a.id ? ` [ID:${a.id}]` : ""}`,
-          `   ⏱ ${fmtDuration(a.moving_time || a.movingTime)}`,
-          (a.distance > 0) ? `   📏 ${(a.distance / 1000).toFixed(2)} km` : null,
-          (a.average_heartrate || a.averageHeartrate) ? `   ❤️  ${fmt0(a.average_heartrate || a.averageHeartrate)} bpm` : null,
-          (a.average_speed || a.averageSpeed) ? `   🏃 ${fmtPace(a.average_speed || a.averageSpeed)}` : null,
-          (a.total_elevation_gain || a.totalElevationGain) ? `   ⛰️  ${fmt0(a.total_elevation_gain || a.totalElevationGain)} m` : null,
-          a.tss      ? `   📊 TSS ${fmt0(a.tss)}` : null,
-          a.calories ? `   🔥 ${fmt0(a.calories)} kcal` : null,
-          (a.perceived_exertion || a.perceivedExertion) ? `   😓 RPE ${a.perceived_exertion || a.perceivedExertion}/10` : null,
-        ].filter(Boolean).join("\n"));
-        return { content: [{ type: "text", text: lines.join("\n\n") }] };
-      } catch (err) {
-        return { content: [{ type: "text", text: `❌ ${err.message}` }] };
-      }
-    }
-  );
-
-  srv.tool("get_activity_detail",
-    "Deep detail for any activity (any date): distance, pace, GAP, HR, zones, load, intensity, aerobic decoupling (Pa:HR), efficiency factor, RPE/feel, gear, laps. Use ID from get_activities [ID:xxx].",
-    {
-      activity_id: z.string().describe("Activity ID e.g. i139521833"),
-      compute_decoupling: z.boolean().optional().describe("Calcular desacoplamiento desde streams si intervals no lo da (default: true)"),
-    },
-    async ({ activity_id, compute_decoupling = true }) => {
-      try {
-        let a;
-        try { a = await fetchActivity(activity_id); } catch (_) { a = null; }
-        if (!a || !a.id) {
-          // Fallback: buscar en la lista de los últimos 60 días
-          const params = new URLSearchParams({ oldest: daysAgo(60), newest: today() });
-          const acts = toArray(await callIntervals(`/athlete/${ATHLETE_ID}/activities?${params}`), "activities");
-          a = acts.find(x => String(x.id) === activity_id || String(x.id) === cleanId(activity_id));
-        }
-        if (!a) return { content: [{ type: "text", text: `⚠️ Actividad ${activity_id} no encontrada.` }] };
-
-        const u  = await getHrZoneUpper();
-        const sp = firstDefined(a.average_speed, a.averageSpeed);
-        const gap = firstDefined(a.gap, a.icu_gap);
-        const load = firstDefined(a.icu_training_load, a.tss);
-        const intensity = firstDefined(a.icu_intensity);
-        const ef  = firstDefined(a.icu_efficiency_factor, a.efficiency_factor);
-        let dec   = firstDefined(a.decoupling, a.icu_decoupling, a.icu_aerobic_decoupling);
-        const rpe = firstDefined(a.icu_rpe, a.perceived_exertion, a.perceivedExertion);
-        const FEEL = { 1: "Muy fuerte 💪", 2: "Fuerte", 3: "Normal", 4: "Flojo", 5: "Muy flojo 😩" };
-
-        const lines = [
-          `📊 ${(a.start_date_local||"").split("T")[0]} — ${a.name||"Activity"} (${a.type||"Run"}) [ID:${a.id}]`,
-          ``,
-          `📏 MÉTRICAS`,
-          `   Distancia:   ${((a.distance||0)/1000).toFixed(2)} km`,
-          `   Duración:    ${fmtDuration(a.moving_time||a.movingTime)}`,
-          sp  ? `   Ritmo medio: ${fmtPace(sp)}` : null,
-          gap ? `   Ritmo GAP (ajustado a pendiente): ${fmtPace(gap)}` : null,
-          (a.total_elevation_gain||a.totalElevationGain) ? `   Desnivel+:   ${fmt0(a.total_elevation_gain||a.totalElevationGain)} m (GPS/intervals — contrastar con Garmin)` : null,
-          a.calories ? `   Calorías:    ${fmt0(a.calories)} kcal` : null,
-          ``,
-          `📈 CARGA`,
-          load != null ? `   Carga (TSS): ${fmt0(load)}` : null,
-          intensity != null ? `   Intensidad:  ${fmt0(intensity)}%` : null,
-          a.trimp != null ? `   TRIMP:       ${fmt0(a.trimp)}` : null,
-          ``,
-          `❤️  FC`,
-          (a.average_heartrate||a.averageHeartrate) ? `   Media:  ${fmt0(a.average_heartrate||a.averageHeartrate)} bpm` : null,
-          (a.max_heartrate||a.maxHeartrate)         ? `   Máxima: ${fmt0(a.max_heartrate||a.maxHeartrate)} bpm` : null,
-        ].filter(v => v != null);
-
-        if (a.average_cadence||a.averageCadence) lines.push(`\n👟 Cadencia: ${fmt0(a.average_cadence||a.averageCadence)} spm`);
-        if (a.average_watts||a.averageWatts)     lines.push(`⚡ Potencia: ${fmt0(a.average_watts||a.averageWatts)} W`);
-
-        // Eficiencia aeróbica
-        let decDetail = null;
-        if (dec == null && compute_decoupling && /run/i.test(a.type || "Run")) {
-          try { decDetail = computeDecoupling(await fetchStreams(a.id)); } catch (_) {}
-          if (decDetail) dec = decDetail.decoupling;
-        }
-        if (dec != null || ef != null) {
-          lines.push(`\n🫀 EFICIENCIA AERÓBICA`);
-          if (dec != null) {
-            lines.push(`   Desacoplamiento Pa:HR: ${fmt1(dec)}%${decDetail ? " (calculado desde streams)" : ""}`);
-            lines.push(`   ${dec < 5 ? "🟢 <5% — acoplado" : dec < 8 ? "🟡 5-8% — deriva moderada" : "🔴 >8% — deriva alta"}`);
-          }
-          if (decDetail) lines.push(`   1ª mitad: ${decDetail.first.pace} @ ${decDetail.first.hr} bpm · 2ª mitad: ${decDetail.second.pace} @ ${decDetail.second.hr} bpm`);
-          if (ef != null) lines.push(`   Efficiency Factor: ${Number(ef).toFixed(3)}`);
-          lines.push(`   (Para un tramo concreto, p.ej. los km a ritmo maratón: get_decoupling con from_km/to_km)`);
-        }
-
-        // Sensaciones
-        if (rpe != null || a.feel != null) {
-          lines.push(`\n😓 SENSACIONES`);
-          if (rpe != null)    lines.push(`   RPE: ${rpe}/10`);
-          if (a.feel != null) lines.push(`   Feel: ${FEEL[a.feel] || a.feel}`);
-        }
-        if (a.description) lines.push(`\n📝 ${a.description}`);
-
-        // Material
-        const gear = a.gear || a.gear_id;
-        if (gear) lines.push(`\n👟 Material: ${gear.name || gear}${gear.distance ? ` (${fmt0(gear.distance/1000)} km acumulados)` : ""}`);
-
-        // Zonas
-        const zt = a.icu_hr_zone_times || a.icu_zone_times || [];
-        if (zt.length) {
-          lines.push(`\n📊 TIEMPO EN ZONAS FC`);
-          const zn = zoneLabels(u);
-          const tot = zt.slice(0, u.length).reduce((x, y) => x + (y || 0), 0) || 1;
-          zt.slice(0, u.length).forEach((sec, i) => { const m = Math.round((sec||0)/60); if (m > 0) lines.push(`   ${zn[i]}: ${m} min (${Math.round((sec||0)/tot*100)}%)`); });
-        }
-
-        const laps = a.laps || [];
-        if (laps.length) {
-          lines.push(`\n🔁 LAPS (${laps.length})`);
-          laps.slice(0,20).forEach((l,i) => {
-            const lsp = l.average_speed||l.averageSpeed;
-            const hr = l.average_heartrate||l.averageHeartrate;
-            lines.push(`  ${i+1}: ${((l.distance||0)/1000).toFixed(2)}km | ${fmtDuration(l.moving_time||l.elapsed_time||0)}${lsp?` | ${fmtPace(lsp)}`:""}${hr?` | ${fmt0(hr)}bpm`:""}`);
+        if (by_week) {
+          const w = Math.min(weeks, 26);
+          const acts = await listActivities(addDays(mondayOf(today()), -7 * (w - 1)), today());
+          const map = {};
+          acts.forEach(a => {
+            const k = mondayOf(actDate(a));
+            const m = map[k] || (map[k] = { runs: 0, n: 0, km: 0, secs: 0, ld: 0 });
+            m.n++; m.secs += a.moving_time || 0; m.ld += firstDefined(a.icu_training_load, a.tss) || 0;
+            if (isRun(a)) { m.runs++; m.km += (a.distance || 0) / 1000; }
           });
+          const rows = Object.entries(map).sort((a, b) => a[0].localeCompare(b[0]));
+          const L = [`📊 SEMANAS (lun-dom) — km de carrera · sesiones · tiempo · carga`];
+          rows.forEach(([k, m]) => L.push(`   ${k}: ${m.km.toFixed(1)} km · ${m.runs} carreras (${m.n} total) · ${fmtDuration(m.secs)} · ${fmt0(m.ld)}`));
+          return { content: [{ type: "text", text: L.join("\n") }] };
         }
-        return { content: [{ type: "text", text: lines.join("\n") }] };
+        const range = safeRange(oldest || daysAgo(30), newest, 180);
+        const acts = (await listActivities(range.oldest, range.newest)).slice().reverse().slice(0, limit);
+        if (!acts.length) return { content: [{ type: "text", text: `No hay actividades (${range.oldest} → ${range.newest}).` }] };
+        const L = acts.map(a => `${actDate(a)} ${a.name || a.type} (${a.type}) [ID:${a.id}] · ${a.distance > 0 ? `${(a.distance / 1000).toFixed(2)} km · ` : ""}${fmtDuration(a.moving_time)}` +
+          `${a.average_speed && isRun(a) ? ` · ${pS(a.average_speed)}` : ""}${a.average_heartrate ? ` · ${fmt0(a.average_heartrate)} bpm` : ""}` +
+          `${firstDefined(a.icu_training_load, a.tss) != null ? ` · carga ${fmt0(firstDefined(a.icu_training_load, a.tss))}` : ""}${firstDefined(a.icu_rpe, a.perceived_exertion) != null ? ` · RPE ${firstDefined(a.icu_rpe, a.perceived_exertion)}` : ""}`);
+        return { content: [{ type: "text", text: L.join("\n") }] };
       } catch (err) {
-        return { content: [{ type: "text", text: `❌ get_activity_detail: ${err.message}` }] };
+        return { content: [{ type: "text", text: `❌ get_activities: ${err.message}` }] };
       }
     }
   );
 
-  srv.tool("get_activity_streams",
-    "Get per-second stream data: HR, cadence, pace, altitude, power. Calculates time in HR zones AND per-km splits.",
+  srv.tool("get_activity_data",
+    "Raw breakdown of one activity when get_post_workout_report is not enough. view: 'splits' (km by km: pace, HR, cadence), 'intervals' (every interval/lap), 'decoupling' (Pa:HR for from_km–to_km), 'zones' (time in HR zones + elevation per km).",
     {
-      activity_id:  z.string().describe("Activity ID e.g. i139521833"),
-      stream_types: z.string().optional().describe("Comma-separated stream types (default: time,heartrate,cadence,velocity_smooth,altitude,distance)"),
-      compact: z.boolean().optional().describe("Salida compacta: solo resumen mínimo + splits en una línea por km (ahorra contexto). Default: false"),
+      activity_id: z.string().describe("ID de la actividad"),
+      view:    z.enum(["splits", "intervals", "decoupling", "zones"]).optional().describe("default: splits"),
+      from_km: z.number().optional().describe("decoupling: inicio del tramo en km"),
+      to_km:   z.number().optional().describe("decoupling: fin del tramo en km"),
     },
-    async ({ activity_id, stream_types, compact = false }) => {
+    async ({ activity_id, view = "splits", from_km, to_km }) => {
       try {
-        const cleanId = activity_id.replace(/^i/, "");
-        const types   = stream_types || "time,heartrate,cadence,velocity_smooth,altitude,distance,watts";
-        const params  = new URLSearchParams({ types });
-
-        let raw;
-        try { raw = await callIntervals(`/activity/${activity_id}/streams?${params}`); }
-        catch (_) { raw = await callIntervals(`/activity/${cleanId}/streams?${params}`); }
-
-        const streams = Array.isArray(raw) ? raw : (raw ? [raw] : []);
-        if (!streams.length) return { content: [{ type: "text", text: "No hay streams para esta actividad." }] };
-
-        const byType = {};
-        streams.forEach(s => { if (s.type) byType[s.type] = s.data || []; });
-
-        const availableTypes = streams.map(s => s.type || s.name).join(", ");
-        const lines = [`📈 Streams disponibles: ${availableTypes}\n`];
-
-        const time = byType.time || [];
-        const hr   = byType.heartrate || byType.heart_rate || [];
-        const vel  = byType.velocity_smooth || byType.speed || byType.velocity || [];
-        const cad  = byType.cadence || [];
-        const alt  = byType.altitude || [];
-        const dist = byType.distance || [];
-        const pwr  = byType.watts || byType.power || [];
-
-        // ── Modo compacto: una línea por km (km ritmo FC cad) ──────────────
-        if (compact && dist.length) {
-          const out = [`⏱ ${fmtDuration(time[time.length-1]||0)} · ${((dist[dist.length-1]||0)/1000).toFixed(2)} km`, `km ritmo FC cad`];
-          const n = Math.ceil((dist[dist.length-1]||0) / 1000);
-          const buckets = Array.from({ length: n }, () => ({ v: [], h: [], c: [] }));
-          for (let i = 0; i < dist.length; i++) {
-            const k = Math.min(Math.floor((dist[i]||0) / 1000), n - 1);
-            if (k < 0) continue;
-            if (vel[i] > 0) buckets[k].v.push(vel[i]);
-            if (hr[i]  > 0) buckets[k].h.push(hr[i]);
-            if (cad[i] > 0) buckets[k].c.push(cad[i]);
-          }
-          buckets.forEach((b, k) => {
-            if (!b.v.length && !b.h.length) return;
-            out.push(`${k+1} ${b.v.length ? fmtPace(mean(b.v)).replace(" min/km","") : "-"} ${b.h.length ? Math.round(mean(b.h)) : "-"} ${b.c.length ? Math.round(mean(b.c)) : "-"}`);
-          });
-          return { content: [{ type: "text", text: out.join("\n") }] };
+        if (view === "intervals") {
+          const raw = await fetchIntervals(activity_id);
+          const ivs = raw?.icu_intervals || [];
+          if (!ivs.length) return { content: [{ type: "text", text: "No hay intervalos para esta actividad." }] };
+          const L = [`🔁 INTERVALOS (${ivs.length})`];
+          ivs.forEach((iv, i) => L.push(`${String(i + 1).padStart(2)} ${iv.type || ""} ${((iv.distance || 0) / 1000).toFixed(2)} km · ${fmtSecs(iv.moving_time || iv.elapsed_time)} · ${pS(iv.average_speed)}` +
+            `${iv.average_heartrate ? ` · FC ${fmt0(iv.average_heartrate)}/${fmt0(iv.max_heartrate)}` : ""}${iv.average_cadence ? ` · ${fmt0(iv.average_cadence)} spm` : ""}`));
+          return { content: [{ type: "text", text: L.join("\n") }] };
         }
-
-        if (time.length) lines.push(`⏱ ${time.length} puntos · duración ${fmtDuration(time[time.length-1]||0)}`);
-
-        // ── Global HR summary ──────────────────────────────────────────────
-        if (hr.length) {
-          const v = hr.filter(x => x > 0);
-          if (v.length) {
-            const avg = Math.round(v.reduce((a,b)=>a+b,0)/v.length);
-            const max = Math.max(...v), min = Math.min(...v);
-            lines.push(`\n❤️  FRECUENCIA CARDÍACA`);
-            lines.push(`   Media: ${avg} bpm | Máx: ${max} bpm | Mín: ${min} bpm`);
-            const u = await getHrZoneUpper();
-            const z = new Array(u.length).fill(0);
-            v.forEach(x => { z[zoneOf(x, u)]++; });
-            const tot = v.length;
-            const zn  = zoneLabels(u);
-            z.forEach((c, i) => {
-              const pct  = Math.round(c/tot*100);
-              const mins = Math.round(c/60);
-              if (pct > 0) lines.push(`   ${zn[i]}: ${pct}% (~${mins} min)`);
-            });
-          }
+        const st = await fetchStreams(activity_id);
+        if (!st.dist.length) return { content: [{ type: "text", text: "No hay streams para esta actividad." }] };
+        if (view === "decoupling") {
+          const r = computeDecoupling(st, from_km != null ? from_km * 1000 : null, to_km != null ? to_km * 1000 : null);
+          if (!r) return { content: [{ type: "text", text: "⚠️ No hay datos suficientes de FC/ritmo en ese tramo (mínimo ~10 min)." }] };
+          return { content: [{ type: "text", text: `🫀 Desacoplamiento${r.km ? ` km ${r.km}` : ""}: ${fmt1(r.decoupling)}% · 1ª mitad ${r.first.pace} @ ${r.first.hr} · 2ª ${r.second.pace} @ ${r.second.hr}\n   ${r.rating}` }] };
         }
-
-        if (vel.length) {
-          const v = vel.filter(x => x > 0);
-          if (v.length) {
-            const avg  = v.reduce((a,b)=>a+b,0)/v.length;
-            const best = fmtPace(Math.max(...v));
-            lines.push(`\n🏃 RITMO`);
-            lines.push(`   Medio: ${fmtPace(avg)}`);
-            if (best) lines.push(`   Mejor momento: ${best}`);
-          }
+        const { time, hr, vel, dist, cad, alt } = st;
+        const n = Math.ceil((dist[dist.length - 1] || 0) / 1000);
+        const b = Array.from({ length: n }, () => ({ v: [], h: [], c: [], a0: null, a1: null }));
+        for (let i = 0; i < dist.length; i++) {
+          const k = Math.min(Math.floor((dist[i] || 0) / 1000), n - 1);
+          if (k < 0) continue;
+          if (vel[i] > 0) b[k].v.push(vel[i]);
+          if (hr[i] > 0) b[k].h.push(hr[i]);
+          if (cad[i] > 0) b[k].c.push(cad[i]);
+          if (alt.length) { if (b[k].a0 == null) b[k].a0 = alt[i]; b[k].a1 = alt[i]; }
         }
-
-        if (cad.length) {
-          const v = cad.filter(x => x > 0);
-          if (v.length) {
-            lines.push(`\n👟 CADENCIA`);
-            lines.push(`   Media: ${Math.round(v.reduce((a,b)=>a+b,0)/v.length)} spm | Máx: ${Math.max(...v)} spm`);
-          }
+        const L = [`⏱ ${fmtDuration(time[time.length - 1] || 0)} · ${((dist[dist.length - 1] || 0) / 1000).toFixed(2)} km`];
+        if (view === "zones" && hr.length) {
+          const u = await getHrZoneUpper();
+          const z = new Array(u.length).fill(0); let tot = 0;
+          hr.forEach(x => { if (x > 0) { z[zoneOf(x, u)]++; tot++; } });
+          L.push(`❤️ ${zoneLabels(u).map((lab, i) => `${lab} ${Math.round(z[i] / tot * 100)}%`).join(" · ")}`);
         }
-
-        if (alt.length) {
-          const max = Math.round(Math.max(...alt));
-          const min = Math.round(Math.min(...alt));
-          lines.push(`\n⛰️  ALTITUD: máx ${max} m | mín ${min} m | desnivel acum: ${max - min} m`);
-        }
-
-        if (pwr.length) {
-          const v = pwr.filter(x => x > 0);
-          if (v.length) {
-            lines.push(`\n⚡ POTENCIA: media ${Math.round(v.reduce((a,b)=>a+b,0)/v.length)} W | máx ${Math.max(...v)} W`);
-          }
-        }
-
-        // ── Per-km splits ──────────────────────────────────────────────────
-        if (dist.length && (hr.length || vel.length)) {
-          const totalDist = dist[dist.length - 1] || 0;
-          const numKm     = Math.floor(totalDist / 1000);
-
-          if (numKm >= 1) {
-            lines.push(`\n📊 SPLITS POR KILÓMETRO`);
-            lines.push(`  ${"Km".padEnd(4)} ${"Ritmo".padEnd(9)} ${"FC".padEnd(7)} ${"Cad".padEnd(6)} Desnivel`);
-            lines.push(`  ${"─".repeat(42)}`);
-
-            for (let km = 1; km <= numKm; km++) {
-              const fromM = (km - 1) * 1000;
-              const toM   = km * 1000;
-
-              // Get indices for this km band
-              const idx = [];
-              dist.forEach((d, i) => { if (d >= fromM && d < toM) idx.push(i); });
-
-              if (!idx.length) continue;
-
-              // Average pace (velocity → min/km)
-              let paceStr = "   -  ";
-              if (vel.length) {
-                const vv = idx.map(i => vel[i]).filter(x => x > 0);
-                if (vv.length) paceStr = fmtPace(vv.reduce((a,b)=>a+b,0)/vv.length);
-              }
-
-              // Average HR
-              let hrStr = "  -  ";
-              if (hr.length) {
-                const hv = idx.map(i => hr[i]).filter(x => x > 0);
-                if (hv.length) hrStr = `${Math.round(hv.reduce((a,b)=>a+b,0)/hv.length)} bpm`;
-              }
-
-              // Average cadence
-              let cadStr = "  - ";
-              if (cad.length) {
-                const cv = idx.map(i => cad[i]).filter(x => x > 0);
-                if (cv.length) cadStr = `${Math.round(cv.reduce((a,b)=>a+b,0)/cv.length)} spm`;
-              }
-
-              // Elevation gain/loss for this km
-              let elevStr = "";
-              if (alt.length) {
-                const av   = idx.map(i => alt[i]);
-                const gain = Math.max(0, Math.round(av[av.length-1] - av[0]));
-                const loss = Math.max(0, Math.round(av[0] - av[av.length-1]));
-                if (gain > 0) elevStr = `↑${gain}m`;
-                if (loss > 0) elevStr += `${elevStr ? " " : ""}↓${loss}m`;
-              }
-
-              lines.push(`  ${String(km).padEnd(4)} ${paceStr.padEnd(9)} ${hrStr.padEnd(7)} ${cadStr.padEnd(6)} ${elevStr}`);
-            }
-
-            // Partial last km if any
-            const remainM = totalDist - numKm * 1000;
-            if (remainM > 50) {
-              const fromM = numKm * 1000;
-              const idx   = [];
-              dist.forEach((d, i) => { if (d >= fromM) idx.push(i); });
-              if (idx.length) {
-                let paceStr = "   -  ";
-                if (vel.length) {
-                  const vv = idx.map(i => vel[i]).filter(x => x > 0);
-                  if (vv.length) paceStr = fmtPace(vv.reduce((a,b)=>a+b,0)/vv.length);
-                }
-                let hrStr = "  -  ";
-                if (hr.length) {
-                  const hv = idx.map(i => hr[i]).filter(x => x > 0);
-                  if (hv.length) hrStr = `${Math.round(hv.reduce((a,b)=>a+b,0)/hv.length)} bpm`;
-                }
-                lines.push(`  ${(numKm + 1 + "*").padEnd(4)} ${paceStr.padEnd(9)} ${hrStr.padEnd(7)} (${Math.round(remainM)}m parcial)`);
-              }
-            }
-          }
-        }
-
-        return { content: [{ type: "text", text: lines.join("\n") }] };
-      } catch (err) {
-        return { content: [{ type: "text", text: `❌ get_activity_streams: ${err.message}` }] };
-      }
-    }
-  );
-
-  srv.tool("get_activity_intervals",
-    "Get detailed interval/lap data for an activity: pace, HR, power, cadence per interval. Best tool for analyzing series and structured workouts.",
-    { activity_id: z.string().describe("Activity ID e.g. i139521833") },
-    async ({ activity_id }) => {
-      try {
-        const cleanId = activity_id.replace(/^i/, "");
-        let raw;
-        try { raw = await callIntervals(`/activity/${activity_id}/intervals`); }
-        catch (_) { raw = await callIntervals(`/activity/${cleanId}/intervals`); }
-
-        if (!raw || typeof raw !== "object") {
-          return { content: [{ type: "text", text: "No hay datos de intervalos para esta actividad." }] };
-        }
-
-        const intervals = raw.icu_intervals || [];
-        const groups    = raw.icu_groups    || [];
-
-        if (!intervals.length && !groups.length) {
-          return { content: [{ type: "text", text: `No se encontraron intervalos. Campos disponibles: ${Object.keys(raw).join(", ")}` }] };
-        }
-
-        const lines = [`🔁 INTERVALOS (${intervals.length} total)\n`];
-
-        intervals.forEach((iv, i) => {
-          const label    = iv.label || iv.name || `Intervalo ${i+1}`;
-          const dist     = iv.distance ? `${(iv.distance/1000).toFixed(2)} km` : null;
-          const dur      = iv.moving_time || iv.elapsed_time || iv.timer_time;
-          const pace     = iv.average_speed || iv.avg_speed;
-          const hr       = iv.average_heartrate || iv.avg_hr;
-          const maxHr    = iv.max_heartrate || iv.max_hr;
-          const watts    = iv.average_watts || iv.avg_watts;
-          const cadence  = iv.average_cadence || iv.avg_cadence;
-          const type     = iv.type || "";
-
-          const parts = [
-            `${i+1}. ${label}${type ? ` [${type}]` : ""}`,
-            dist ? `   📏 ${dist}` : null,
-            dur  ? `   ⏱ ${fmtDuration(dur)}` : null,
-            pace ? `   🏃 ${fmtPace(pace)}` : null,
-            hr   ? `   ❤️  FC media: ${fmt0(hr)} bpm${maxHr ? ` | máx: ${fmt0(maxHr)} bpm` : ""}` : null,
-            watts   ? `   ⚡ ${fmt0(watts)} W` : null,
-            cadence ? `   👟 ${fmt0(cadence)} spm` : null,
-          ].filter(Boolean);
-
-          lines.push(parts.join("\n"));
+        L.push(view === "zones" ? `km ritmo FC cad desnivel(GPS)` : `km ritmo FC cad`);
+        b.forEach((x, k) => {
+          if (!x.v.length && !x.h.length) return;
+          const el = view === "zones" && x.a0 != null ? ` ${x.a1 - x.a0 >= 0 ? "+" : ""}${Math.round(x.a1 - x.a0)}m` : "";
+          L.push(`${k + 1} ${x.v.length ? pS(mean(x.v)) : "-"} ${x.h.length ? Math.round(mean(x.h)) : "-"} ${x.c.length ? Math.round(mean(x.c)) : "-"}${el}`);
         });
-
-        // Groups (series agrupadas)
-        if (groups.length) {
-          lines.push(`\n📊 GRUPOS/SERIES (${groups.length})`);
-          groups.forEach((g, i) => {
-            const count = g.count || g.reps || "";
-            const name  = g.name || g.label || `Grupo ${i+1}`;
-            lines.push(`  ${i+1}. ${name}${count ? ` × ${count}` : ""}`);
-          });
-        }
-
-        return { content: [{ type: "text", text: lines.join("\n") }] };
+        return { content: [{ type: "text", text: L.join("\n") }] };
       } catch (err) {
-        return { content: [{ type: "text", text: `❌ get_activity_intervals: ${err.message}` }] };
+        return { content: [{ type: "text", text: `❌ get_activity_data: ${err.message}` }] };
       }
     }
   );
 
   srv.tool("get_wellness",
-    "Get wellness data: HRV, resting HR, sleep, weight, steps, calories, stress, SpO2, Body Battery, fatigue, mood, motivation, soreness",
+    "Wellness by day: HRV, resting HR, sleep, VO2max, weight, subjective scores. With raw_date: dump every raw field for that day (debug).",
     {
-      start_date: z.string().optional().describe("Start date YYYY-MM-DD (default: 14 days ago)"),
-      end_date:   z.string().optional().describe("End date YYYY-MM-DD (default: today)"),
+      start_date: z.string().optional().describe("YYYY-MM-DD (default: hace 14 días)"),
+      end_date:   z.string().optional().describe("YYYY-MM-DD (default: hoy)"),
+      raw_date:   z.string().optional().describe("YYYY-MM-DD: volcar todos los campos de ese día"),
     },
-    async ({ start_date, end_date }) => {
+    async ({ start_date, end_date, raw_date }) => {
       try {
-        const range  = safeRange(start_date || daysAgo(14), end_date, 180);
-        const params = new URLSearchParams({ oldest: range.oldest, newest: range.newest });
-        const data   = await callIntervals(`/athlete/${ATHLETE_ID}/wellness?${params}`);
-        // No filter — show all entries that have ANY non-null value
-        const entries = toArray(data, "wellness").filter(w =>
-          Object.values(w).some(v => v != null && v !== w.id)
-        );
-        if (!entries.length) return { content: [{ type: "text", text: "No wellness data in range." }] };
-
-        // Known display fields
-        const lines = entries.map(w => {
-          const known = [
-            `📅 ${w.id}`,
-            w.hrv          ? `   💓 HRV: ${w.hrv}` : null,
-            w.restingHR    ? `   ❤️  FC reposo: ${w.restingHR} bpm` : null,
-            w.sleepSecs    ? `   😴 Sueño: ${fmtSleep(w.sleepSecs)}` : null,
-            w.vo2max       ? `   🫁 VO2max: ${w.vo2max}` : null,
-            w.sleepScore   ? `   💤 Calidad sueño: ${w.sleepScore}/100` : null,
-            w.sleepQuality != null ? `   💤 Calidad (1-5): ${w.sleepQuality}/5` : null,
-            w.steps        ? `   👣 Pasos: ${w.steps.toLocaleString()}` : null,
-            w.calories     ? `   🔥 Calorías: ${w.calories} kcal` : null,
-            w.weight       ? `   ⚖️  Peso: ${w.weight} kg` : null,
-            w.vo2max       ? `   🫁 VO2max: ${w.vo2max}` : null,
-            w.rampRate     != null ? `   📈 Ramp rate CTL: ${Number(w.rampRate).toFixed(2)}/semana` : null,
-            w.bodyBattery  ? `   🔋 Body Battery: ${w.bodyBattery}` : null,
-            w.avgBodyBattery ? `   🔋 Body Battery media: ${w.avgBodyBattery}` : null,
-            w.stress       ? `   😰 Estrés: ${w.stress}` : null,
-            w.avgStress    ? `   😰 Estrés medio: ${w.avgStress}` : null,
-            w.spO2         ? `   🫁 SpO2: ${w.spO2}%` : null,
-            w.respiration  ? `   💨 Respiración: ${w.respiration} rpm` : null,
-            w.menstrualCyclePhase ? `   🔴 Ciclo: ${w.menstrualCyclePhase}` : null,
-            w.fatigue      != null ? `   😩 Fatiga: ${w.fatigue}/10` : null,
-            w.mood         != null ? `   😊 Ánimo: ${w.mood}/10` : null,
-            w.motivation   != null ? `   🔥 Motivación: ${w.motivation}/10` : null,
-            w.soreness     != null ? `   💪 Agujetas: ${w.soreness}/10` : null,
-            w.notes        ? `   📝 ${w.notes}` : null,
-          ].filter(Boolean);
-
-          // Dump any extra fields not in the known list
-          const knownKeys = new Set(["id","hrv","restingHR","sleepSecs","sleepScore","sleepQuality","steps","calories","weight","vo2max","rampRate","ctlLoad","atlLoad","sportInfo","bodyBattery","avgBodyBattery","stress","avgStress","spO2","respiration","fatigue","mood","motivation","soreness","notes","ctl","atl","tsb","menstrualCyclePhase","updated","tempWeight","tempRestingHR"]);
-          const extras = Object.entries(w)
-            .filter(([k, v]) => !knownKeys.has(k) && v != null)
-            .map(([k, v]) => `   📌 ${k}: ${v}`);
-          if (extras.length) known.push(...extras);
-
-          return known.join("\n");
-        });
-        return { content: [{ type: "text", text: lines.join("\n\n") }] };
+        if (raw_date) {
+          const e = toArray(await callIntervals(`/athlete/${ATHLETE_ID}/wellness?${new URLSearchParams({ oldest: raw_date, newest: raw_date })}`), "wellness")[0];
+          if (!e) return { content: [{ type: "text", text: `No hay wellness para ${raw_date}` }] };
+          return { content: [{ type: "text", text: Object.entries(e).filter(([, v]) => v != null).map(([k, v]) => `${k}: ${JSON.stringify(v)}`).join("\n") }] };
+        }
+        const range = safeRange(start_date || daysAgo(14), end_date, 180);
+        const entries = toArray(await callIntervals(`/athlete/${ATHLETE_ID}/wellness?${new URLSearchParams({ oldest: range.oldest, newest: range.newest })}`), "wellness")
+          .filter(w => w.hrv || w.restingHR || w.sleepSecs || w.weight || w.vo2max);
+        if (!entries.length) return { content: [{ type: "text", text: "No hay datos de wellness en el rango." }] };
+        const L = [`fecha      HRV  FCr  sueño      score VO2  otros`];
+        entries.forEach(w => L.push(`${w.id} ${String(w.hrv || "-").padStart(4)} ${String(w.restingHR || "-").padStart(4)}  ${(w.sleepSecs ? fmtSleep(w.sleepSecs) : "-").padEnd(10)} ${String(w.sleepScore || "-").padStart(4)} ${String(w.vo2max || "-").padStart(4)}` +
+          `${["fatigue", "soreness", "mood", "motivation", "weight"].filter(k => w[k] != null).map(k => ` ${k} ${w[k]}`).join("")}${w.comments || w.notes ? ` 📝 ${w.comments || w.notes}` : ""}`));
+        return { content: [{ type: "text", text: L.join("\n") }] };
       } catch (err) {
         return { content: [{ type: "text", text: `❌ get_wellness: ${err.message}` }] };
       }
     }
   );
 
-  srv.tool("get_wellness_raw",
-    "Dump ALL raw fields from a single wellness entry to discover available data. Use to debug missing fields like VO2max.",
-    { date: z.string().optional().describe("Date YYYY-MM-DD (default: today)") },
-    async ({ date }) => {
-      try {
-        const d      = date || today();
-        const params = new URLSearchParams({ oldest: d, newest: d });
-        const data   = await callIntervals(`/athlete/${ATHLETE_ID}/wellness?${params}`);
-        const entries = toArray(data, "wellness");
-        if (!entries.length) return { content: [{ type: "text", text: `No wellness entry for ${d}` }] };
-        const entry = entries[0];
-        const lines = [`🔍 RAW WELLNESS — ${entry.id}\n`];
-        Object.entries(entry)
-          .filter(([, v]) => v != null)
-          .forEach(([k, v]) => lines.push(`  ${k}: ${JSON.stringify(v)}`));
-        return { content: [{ type: "text", text: lines.join("\n") }] };
-      } catch (err) {
-        return { content: [{ type: "text", text: `❌ get_wellness_raw: ${err.message}` }] };
-      }
-    }
-  );
-
   srv.tool("get_fitness",
-    "Get CTL (fitness), ATL (fatigue), TSB (form) training load curves. TSB = CTL - ATL.",
+    "CTL (fitness), ATL (fatigue), TSB (form) and ramp rate: daily for the last 14 days, or with weeks=N the weekly trend (Sunday values) over N weeks.",
     {
-      start_date: z.string().optional().describe("Start date YYYY-MM-DD (default: 42 days ago)"),
-      end_date:   z.string().optional().describe("End date YYYY-MM-DD (default: today)"),
+      start_date: z.string().optional().describe("YYYY-MM-DD (default: hace 42 días)"),
+      end_date:   z.string().optional().describe("YYYY-MM-DD (default: hoy)"),
+      weeks:      z.number().optional().describe("Tendencia semanal de N semanas (máx 52)"),
     },
-    async ({ start_date, end_date }) => {
+    async ({ start_date, end_date, weeks }) => {
       try {
-        const range  = safeRange(start_date || daysAgo(42), end_date, 180);
-        const params = new URLSearchParams({ oldest: range.oldest, newest: range.newest });
-        const data   = await callIntervals(`/athlete/${ATHLETE_ID}/wellness?${params}`);
-        const entries = toArray(data, "wellness");
-        const withLoad = entries.filter(d => d.ctl != null || d.atl != null);
-        if (!withLoad.length) {
-          const sample = entries[entries.length - 1] || {};
-          return { content: [{ type: "text", text: `⚠️ No CTL/ATL data. Campos disponibles: ${Object.keys(sample).join(", ")}` }] };
-        }
-        const latest = withLoad[withLoad.length - 1];
-        // TSB = CTL - ATL (calculate if not in API response)
-        const tsbLatest = latest.tsb != null ? latest.tsb : (latest.ctl != null && latest.atl != null ? latest.ctl - latest.atl : null);
-        const header = [
-          `📊 CARGA DE ENTRENAMIENTO`,
-          `Último dato (${latest.id}):`,
-          `   CTL (Forma crónica): ${fmt1(latest.ctl)}`,
-          `   ATL (Fatiga aguda):  ${fmt1(latest.atl)}`,
-          `   TSB (Frescura):      ${tsbLatest != null ? fmt1(tsbLatest) : "N/A"}`,
-          latest.rampRate != null ? `   Ramp rate:           ${Number(latest.rampRate).toFixed(2)}/semana` : null,
-          tsbLatest != null ? `   Estado: ${tsbLatest > 5 ? "🟢 Fresco" : tsbLatest > -10 ? "🟡 Óptimo" : tsbLatest > -25 ? "🟠 Cansado" : "🔴 Sobreentrenamiento"}` : null,
-          `\nÚltimos ${Math.min(withLoad.length, 14)} días:`,
-        ].filter(Boolean).join("\n");
-
-        const rows = withLoad.slice(-14).map(d => {
-          const tsb = d.tsb != null ? d.tsb : (d.ctl != null && d.atl != null ? d.ctl - d.atl : null);
-          return `  ${d.id}  CTL ${fmt1(d.ctl).padStart(5)}  ATL ${fmt1(d.atl).padStart(5)}  TSB ${tsb != null ? fmt1(tsb).padStart(6) : "   N/A"}`;
-        });
-
-        return { content: [{ type: "text", text: header + "\n" + rows.join("\n") }] };
+        const oldest = weeks ? daysAgo(Math.min(weeks, 52) * 7) : (start_date || daysAgo(42));
+        const newest = weeks ? today() : (end_date || today());
+        const entries = toArray(await callIntervals(`/athlete/${ATHLETE_ID}/wellness?${new URLSearchParams({ oldest, newest })}`), "wellness")
+          .filter(x => x.ctl != null).sort((a, b) => String(a.id).localeCompare(String(b.id)));
+        if (!entries.length) return { content: [{ type: "text", text: "No hay datos de CTL/ATL." }] };
+        const t = (x) => x.ctl - x.atl;
+        const icon = (v) => v > 5 ? "🟢" : v > -10 ? "🟡" : v > -25 ? "🟠" : "🔴";
+        const last = entries[entries.length - 1];
+        const L = [`📊 ${last.id}: CTL ${fmt1(last.ctl)} · ATL ${fmt1(last.atl)} · TSB ${fmt1(t(last))} ${icon(t(last))}${last.rampRate != null ? ` · ramp ${Number(last.rampRate).toFixed(2)}/sem` : ""}`];
+        if (weeks) {
+          const byWeek = {};
+          entries.forEach(x => { byWeek[mondayOf(x.id)] = x; });
+          Object.entries(byWeek).sort((a, b) => a[0].localeCompare(b[0])).forEach(([m, x]) => L.push(`   sem ${m}: CTL ${fmt1(x.ctl)} · ATL ${fmt1(x.atl)} · TSB ${fmt1(t(x))} ${icon(t(x))}`));
+        } else entries.slice(-14).forEach(x => L.push(`   ${x.id}: CTL ${fmt1(x.ctl)} · ATL ${fmt1(x.atl)} · TSB ${fmt1(t(x))}`));
+        return { content: [{ type: "text", text: L.join("\n") }] };
       } catch (err) {
         return { content: [{ type: "text", text: `❌ get_fitness: ${err.message}` }] };
       }
     }
   );
 
-  srv.tool("get_weekly_stats",
-    "Weekly training totals: km, duration, sessions, TSS, calories per week.",
-    { weeks: z.number().optional().describe("Weeks to look back (default: 8, max: 12)") },
-    async ({ weeks = 8 }) => {
-      try {
-        const w      = Math.min(weeks, 12);
-        const params = new URLSearchParams({ oldest: daysAgo(w * 7), newest: today() });
-        const data   = await callIntervals(`/athlete/${ATHLETE_ID}/activities?${params}`);
-        const acts   = toArray(data, "activities");
-        if (!acts.length) return { content: [{ type: "text", text: "No activities found." }] };
-        const map = {};
-        for (const a of acts) {
-          const ds = (a.start_date_local || a.date || "").split("T")[0];
-          if (!ds) continue;
-          const d = new Date(ds), day = d.getDay();
-          const mon = new Date(d);
-          mon.setDate(d.getDate() + (day === 0 ? -6 : 1 - day));
-          const key = mon.toISOString().split("T")[0];
-          if (!map[key]) map[key] = { sessions: 0, distance: 0, duration: 0, tss: 0, calories: 0 };
-          map[key].sessions++;
-          map[key].distance += a.distance || 0;
-          map[key].duration += a.moving_time || a.movingTime || 0;
-          map[key].tss      += a.tss || 0;
-          map[key].calories += a.calories || 0;
-        }
-        const sorted = Object.entries(map).sort((a, b) => a[0].localeCompare(b[0]));
-        const lines  = [`📊 WEEKLY STATS (${w} semanas)\n${"─".repeat(40)}`];
-        for (const [week, s] of sorted) {
-          lines.push([
-            `📅 Semana ${week}`,
-            `   🏃 ${s.sessions} sesiones  📏 ${(s.distance/1000).toFixed(1)} km  ⏱ ${fmtDuration(s.duration)}`,
-            s.tss > 0      ? `   📊 TSS: ${fmt0(s.tss)}` : null,
-            s.calories > 0 ? `   🔥 ${fmt0(s.calories)} kcal` : null,
-          ].filter(Boolean).join("\n"));
-        }
-        const avgKm  = sorted.reduce((s,[,w]) => s + w.distance, 0) / sorted.length / 1000;
-        const avgSes = sorted.reduce((s,[,w]) => s + w.sessions, 0) / sorted.length;
-        lines.push(`\n📈 Media: ${avgKm.toFixed(1)} km/semana · ${avgSes.toFixed(1)} sesiones/semana`);
-        return { content: [{ type: "text", text: lines.join("\n\n") }] };
-      } catch (err) {
-        return { content: [{ type: "text", text: `❌ ${err.message}` }] };
-      }
-    }
-  );
-
   srv.tool("get_events",
-    "Get planned workouts and events from the intervals.icu calendar",
+    "Planned workouts/events from the calendar (with their full workout text), or one event by event_id.",
     {
-      start_date: z.string().optional().describe("Start date YYYY-MM-DD (default: today)"),
-      end_date:   z.string().optional().describe("End date YYYY-MM-DD (default: 21 days ahead)"),
+      start_date: z.string().optional().describe("YYYY-MM-DD (default: hoy)"),
+      end_date:   z.string().optional().describe("YYYY-MM-DD (default: +21 días)"),
+      event_id:   z.string().optional().describe("Un evento concreto por su ID"),
     },
-    async ({ start_date, end_date }) => {
+    async ({ start_date, end_date, event_id }) => {
       try {
-        const params = new URLSearchParams({ oldest: start_date || today(), newest: end_date || daysAhead(21) });
-        const data   = await callIntervals(`/athlete/${ATHLETE_ID}/events?${params}`);
-        const events = toArray(data, "events");
-        if (!events.length) return { content: [{ type: "text", text: "No planned events." }] };
-        const lines = events.map(e => [
-          `📅 ${(e.start_date_local || e.date || "").split("T")[0]} — ${e.name || "Event"} (${e.type || e.category || "Event"}) [ID:${e.id}]`,
-          e.description ? `   📝 ${e.description}` : null,
-          e.load        ? `   📊 Carga objetivo: ${e.load}` : null,
-          e.moving_time ? `   ⏱ Duración: ${fmtDuration(e.moving_time)}` : null,
-          e.distance    ? `   📏 Distancia: ${(e.distance/1000).toFixed(1)} km` : null,
-        ].filter(Boolean).join("\n"));
-        return { content: [{ type: "text", text: lines.join("\n\n") }] };
+        const evs = event_id
+          ? [await callIntervals(`/athlete/${ATHLETE_ID}/events/${event_id}`)].flat()
+          : toArray(await callIntervals(`/athlete/${ATHLETE_ID}/events?${new URLSearchParams({ oldest: start_date || today(), newest: end_date || daysAhead(21) })}`), "events");
+        if (!evs.length || !evs[0]) return { content: [{ type: "text", text: "No hay eventos planificados." }] };
+        const L = evs.map(e => {
+          const pk = plannedKm(e);
+          return `📅 ${(e.start_date_local || "").replace("T", " ").slice(0, 16)} ${dayLabel((e.start_date_local || "").slice(0, 10))} — ${e.name || "Evento"} (${e.type || e.category || "?"}) [ID:${e.id}]` +
+            `${pk ? ` · ${pk.toFixed(1)} km` : ""}${e.moving_time ? ` · ${fmtDuration(e.moving_time)}` : ""}${e.load ? ` · carga ${fmt0(e.load)}` : ""}` +
+            `${e.description ? `\n${e.description.split("\n").map(x => `   ${x}`).join("\n")}` : ""}`;
+        });
+        return { content: [{ type: "text", text: L.join("\n\n") }] };
       } catch (err) {
         return { content: [{ type: "text", text: `❌ get_events: ${err.message}` }] };
       }
     }
   );
 
-  srv.tool("get_event_by_id",
-    "Get full details of a specific calendar event or planned workout by its ID.",
-    { event_id: z.string().describe("Event ID (shown as [ID:xxx] in get_events)") },
-    async ({ event_id }) => {
-      try {
-        const data = await callIntervals(`/athlete/${ATHLETE_ID}/events/${event_id}`);
-        if (!data || typeof data !== "object") {
-          return { content: [{ type: "text", text: `No event found with ID ${event_id}` }] };
-        }
-        const e = Array.isArray(data) ? data[0] : data;
-        const lines = [
-          `📅 EVENTO: ${(e.start_date_local || e.date || "").split("T")[0]} — ${e.name || "Event"}`,
-          e.type || e.category ? `   Tipo: ${e.type || e.category}` : null,
-          e.description        ? `   📝 ${e.description}` : null,
-          e.load               ? `   📊 Carga objetivo: ${e.load}` : null,
-          e.moving_time        ? `   ⏱ Duración: ${fmtDuration(e.moving_time)}` : null,
-          e.distance           ? `   📏 Distancia: ${(e.distance/1000).toFixed(1)} km` : null,
-          e.pace_target        ? `   🏃 Ritmo objetivo: ${e.pace_target}` : null,
-          e.hr_target          ? `   ❤️  FC objetivo: ${e.hr_target}` : null,
-          e.id                 ? `   🆔 ID: ${e.id}` : null,
-        ].filter(Boolean);
-        return { content: [{ type: "text", text: lines.join("\n") }] };
-      } catch (err) {
-        return { content: [{ type: "text", text: `❌ get_event_by_id: ${err.message}` }] };
-      }
-    }
-  );
-
-  srv.tool("get_records",
-    "Get athlete personal records. Note: not available on FREE plan of intervals.icu.",
-    {},
-    async () => {
-      return { content: [{ type: "text", text: "⚠️ El endpoint de récords no está disponible en el plan FREE de intervals.icu." }] };
-    }
-  );
-
-  srv.tool("get_training_load",
-    "Get detailed training load history: CTL, ATL, TSB, rampRate, fitness trend over the last months.",
+  srv.tool("create_events",
+    "Create one or many calendar events in ONE call (a whole week on Sundays). Each event: date, name, type (Run/WeightTraining/…), description in intervals.icu workout text format, optional duration_mins, distance_km, load, time (HH:MM). Default time: Saturday 09:00, other days 19:00. Strength-session duration is fixed automatically.",
     {
-      weeks: z.number().optional().describe("Weeks of history (default: 16, max: 52)"),
+      events: z.array(z.object({
+        date:          z.string().describe("YYYY-MM-DD"),
+        name:          z.string(),
+        type:          z.string().optional().describe("Run (default), WeightTraining, Ride, Swim…"),
+        description:   z.string().optional().describe("Estructura del entreno en formato intervals.icu"),
+        duration_mins: z.number().optional(),
+        distance_km:   z.number().optional(),
+        load:          z.number().optional(),
+        time:          z.string().optional().describe("HH:MM para sobrescribir la hora por defecto"),
+        category:      z.enum(["WORKOUT", "RACE_A", "RACE_B", "RACE_C", "NOTE"]).optional().describe("default: WORKOUT (carreras: RACE_A/B/C)"),
+      })).min(1).max(30),
     },
-    async ({ weeks = 16 }) => {
+    async ({ events }) => {
       try {
-        const safeWeeks = Math.min(weeks, 52);
-        const params = new URLSearchParams({ oldest: daysAgo(safeWeeks * 7), newest: today() });
-        const data   = await callIntervals(`/athlete/${ATHLETE_ID}/wellness?${params}`);
-        const entries = toArray(data, "wellness").filter(d => d.ctl != null || d.atl != null);
-        if (!entries.length) return { content: [{ type: "text", text: "No training load data." }] };
+        const bodies = events.map(e => {
+          const t = e.time ? `${e.time}:00` : (dayOfWeek(e.date) === 6 ? "09:00:00" : "19:00:00");
+          return {
+            start_date_local: `${e.date}T${t}`,
+            name: e.name,
+            type: e.type || "Run",
+            category: e.category || "WORKOUT",
+            description: e.description || "",
+            ...(e.duration_mins && { moving_time: e.duration_mins * 60 }),
+            ...(e.distance_km   && { distance: Math.round(e.distance_km * 1000) }),
+            ...(e.load          && { load: e.load }),
+          };
+        });
+        const res = await callIntervals(`/athlete/${ATHLETE_ID}/events/bulk`, "POST", bodies);
+        const created = Array.isArray(res) ? res : toArray(res, "events");
 
-        // Weekly summary of load
-        const weeks_map = {};
-        entries.forEach(d => {
-          const dt  = new Date(d.id);
-          const day = dt.getDay();
-          const mon = new Date(dt);
-          mon.setDate(dt.getDate() + (day === 0 ? -6 : 1 - day));
-          const key = mon.toISOString().split("T")[0];
-          if (!weeks_map[key]) weeks_map[key] = { entries: [] };
-          weeks_map[key].entries.push(d);
+        // intervals devuelve los eventos ordenados por fecha → emparejar por fecha + nombre, nunca por posición
+        const pool = [...created];
+        const matched = events.map(e => {
+          const k = pool.findIndex(c => (c.start_date_local || "").startsWith(e.date) && c.name === e.name);
+          return k === -1 ? null : pool.splice(k, 1)[0];
         });
 
-        const latest = entries[entries.length - 1];
-        const tsbNow = latest.tsb != null ? latest.tsb : (latest.ctl - latest.atl);
-        const lines = [
-          `📊 CARGA DE ENTRENAMIENTO — ${safeWeeks} semanas`,
-          ``,
-          `Hoy (${latest.id}):`,
-          `   CTL: ${fmt1(latest.ctl)} | ATL: ${fmt1(latest.atl)} | TSB: ${fmt1(tsbNow)}`,
-          `   Estado: ${tsbNow > 5 ? "🟢 Fresco" : tsbNow > -10 ? "🟡 Óptimo" : tsbNow > -25 ? "🟠 Cansado" : "🔴 Sobreentrenamiento"}`,
-          ``,
-          `Tendencia semanal (fin de semana):`,
-        ];
-
-        Object.entries(weeks_map)
-          .sort((a, b) => a[0].localeCompare(b[0]))
-          .forEach(([weekStart, { entries: wEntries }]) => {
-            const last = wEntries[wEntries.length - 1];
-            const tsb  = last.tsb != null ? last.tsb : (last.ctl - last.atl);
-            const trend = tsb > 5 ? "🟢" : tsb > -10 ? "🟡" : tsb > -25 ? "🟠" : "🔴";
-            lines.push(`  ${weekStart}  CTL ${fmt1(last.ctl).padStart(5)}  ATL ${fmt1(last.atl).padStart(5)}  TSB ${fmt1(tsb).padStart(6)} ${trend}`);
-          });
-
-        return { content: [{ type: "text", text: lines.join("\n") }] };
-      } catch (err) {
-        return { content: [{ type: "text", text: `❌ get_training_load: ${err.message}` }] };
-      }
-    }
-  );
-
-  srv.tool("get_sport_settings",
-    "Get running sport settings: HR zones, pace zones, Critical Speed (CS), D prime, threshold pace.",
-    {},
-    async () => {
-      try {
-        const data    = await callIntervals(`/athlete/${ATHLETE_ID}/sport-settings`);
-        const configs = Array.isArray(data) ? data : [data];
-
-        // Find running config
-        const runCfg = pickRunConfig(configs);
-
-        const lines = [`⚙️ CONFIGURACIÓN RUNNING\n`];
-
-        // If no running config, show what exists and calculate from known CS
-        if (!runCfg) {
-          const allTypes = configs.map((c, i) => `  Config ${i+1}: ${(c.types||[]).join(", ")}`).join("\n");
-          lines.push(`ℹ️  No hay config de running en la API. Configs encontradas:\n${allTypes}\n`);
-        }
-
-        // Get threshold pace — from running config or fallback to any config with it
-        const anyWithPace = configs.find(c => c.threshold_pace);
-        const cs_source   = runCfg?.threshold_pace || anyWithPace?.threshold_pace || null;
-        const lthr        = runCfg?.lthr || configs[0]?.lthr || null;
-        const maxHR       = runCfg?.max_hr || configs[0]?.max_hr || null;
-        const wPrime      = runCfg?.w_prime || null;
-
-        lines.push(`🎯 UMBRALES`);
-        if (lthr)      lines.push(`   LTHR: ${lthr} bpm`);
-        if (maxHR)     lines.push(`   FC máxima: ${maxHR} bpm`);
-        if (cs_source) lines.push(`   CS / Ritmo umbral: ${cs_source}`);
-        if (wPrime)    lines.push(`   D': ${wPrime} m`);
-        lines.push("");
-
-        // Calculate pace zones from CS
-        // Percentages from intervals.icu standard model confirmed from user's settings
-        const PACE_ZONES = [
-          { name: "Z1 (Recovery)",    pctMin: 0,     pctMax: 77.5  },
-          { name: "Z2 (Endurance)",   pctMin: 78.5,  pctMax: 87.7  },
-          { name: "Z3 (Tempo)",       pctMin: 88.7,  pctMax: 94.3  },
-          { name: "Z4 (Threshold)",   pctMin: 95.3,  pctMax: 100   },
-          { name: "Z5a (VO2max)",     pctMin: 101,   pctMax: 103.4 },
-          { name: "Z5b (Anaerobic)",  pctMin: 104.4, pctMax: 111.5 },
-          { name: "Z5c (Sprint)",     pctMin: 112.5, pctMax: 999   },
-        ];
-
-        // Parse CS — intervals stores threshold_pace as m/s (e.g. 4.0650406 = 4:06/km)
-        const parseCS = (cs) => {
-          if (!cs) return null;
-          const val = parseFloat(String(cs));
-          if (isNaN(val)) return null;
-          // If value > 20, assume it's already in seconds/km — unlikely for running
-          // If value < 20, it's m/s → convert to seconds/km
-          if (val > 0 && val < 20) {
-            return 1000 / val; // seconds per km
+        // Fijar duración de las sesiones de fuerza
+        await Promise.all(events.map(async (e, i) => {
+          const c = matched[i];
+          if (c?.id && e.duration_mins && /weight|strength/i.test(e.type || "")) {
+            try { await callIntervals(`/athlete/${ATHLETE_ID}/events/${c.id}`, "PUT", { moving_time: e.duration_mins * 60 }); } catch (_) {}
           }
-          return val; // already in seconds/km
-        };
+        }));
 
-        const secPerKm = (secs) => {
-          const m = Math.floor(secs / 60);
-          const s = Math.round(secs % 60);
-          return `${m}:${String(s).padStart(2, "0")}`;
-        };
-
-        const csSource = runCfg?.threshold_pace || anyWithPace?.threshold_pace;
-        const csSecs   = parseCS(csSource);
-
-        if (csSecs) {
-          lines.push(`🏃 ZONAS RITMO (calculadas desde CS = ${csSource})`);
-          PACE_ZONES.forEach(z => {
-            const fast = z.pctMax >= 999 ? "<" + secPerKm(csSecs / 1.125) : secPerKm(csSecs / (z.pctMax / 100));
-            const slow = z.pctMin === 0 ? ">" + secPerKm(csSecs / 0.775) : secPerKm(csSecs / (z.pctMin / 100));
-            if (z.pctMin === 0) {
-              lines.push(`   ${z.name}: >${secPerKm(csSecs / (z.pctMax/100))} min/km`);
-            } else if (z.pctMax >= 999) {
-              lines.push(`   ${z.name}: <${secPerKm(csSecs / (z.pctMin/100))} min/km`);
-            } else {
-              lines.push(`   ${z.name}: ${secPerKm(csSecs / (z.pctMax/100))}–${secPerKm(csSecs / (z.pctMin/100))} min/km`);
-            }
-          });
-        } else {
-          lines.push(`🏃 ZONAS RITMO: CS no disponible en API.`);
-          lines.push(`   Para activarlas: intervals.icu → Settings → Deportes → Running → Ritmo umbral`);
-        }
-        lines.push("");
-
-        // Running HR zones — calculated from LTHR (same model as intervals.icu UI)
-        // Confirmed from user's settings: Z1 0-133, Z2 134-148, Z3 149-163, Z4 164-178, Z5 179+
-        const HR_ZONES = [
-          { name: "Z1 Recovery",    pctMax: 0.76  },
-          { name: "Z2 Endurance",   pctMax: 0.85  },
-          { name: "Z3 Tempo",       pctMax: 0.93  },
-          { name: "Z4 Threshold",   pctMax: 1.02  },
-          { name: "Z5 Interval",    pctMax: 99    },
-        ];
-        const lthrVal = lthr || runCfg?.lthr || configs[0]?.lthr;
-        if (Array.isArray(runCfg?.hr_zones) && runCfg.hr_zones.length) {
-          lines.push(`\n❤️  ZONAS FC CONFIGURADAS EN INTERVALS (las que usan todos los análisis)`);
-          zoneLabels(runCfg.hr_zones.map(Number)).forEach(l => lines.push(`   ${l} bpm`));
-        }
-        if (lthrVal) {
-          lines.push(`\n❤️  ZONAS FC TEÓRICAS (calculadas desde LTHR = ${lthrVal} bpm, modelo 5 zonas)`);
-          let prev = 0;
-          HR_ZONES.forEach(z => {
-            const upper = z.pctMax >= 99 ? maxHR || 193 : Math.round(lthrVal * z.pctMax);
-            lines.push(`   ${z.name}: ${prev === 0 ? 0 : prev + 1}–${upper} bpm`);
-            prev = upper;
-          });
-        }
-
-        return { content: [{ type: "text", text: lines.join("\n") }] };
+        const L = [`✅ ${created.length || events.length} eventos creados`];
+        events.forEach((e, i) => L.push(`   ${e.date} — ${e.name} (${e.type || "Run"})${matched[i]?.id ? ` [ID:${matched[i].id}]` : ""}`));
+        return { content: [{ type: "text", text: L.join("\n") }] };
       } catch (err) {
-        return { content: [{ type: "text", text: `❌ get_sport_settings: ${err.message}` }] };
-      }
-    }
-  );
-
-  srv.tool("get_performance_data",
-    "Get performance data: Critical Speed (CS), D prime, pace zones from running settings.",
-    { sport: z.string().optional().describe("Sport: Run, Ride (default: Run)") },
-    async ({ sport = "Run" }) => {
-      try {
-        const data    = await callIntervals(`/athlete/${ATHLETE_ID}/sport-settings`);
-        const configs = Array.isArray(data) ? data : [data];
-        const runCfg  = pickRunConfig(configs);
-        const cfg     = runCfg || configs[0];
-
-        const cs    = cfg?.threshold_pace;
-        const wPrime= cfg?.w_prime;
-        const lthr  = cfg?.lthr;
-
-        const lines = [`📈 DATOS DE RENDIMIENTO — ${sport}\n`];
-
-        if (cs) {
-          const csSecs = 1000 / parseFloat(cs); // threshold_pace viene en m/s
-          const mins   = Math.floor(csSecs / 60);
-          const secs   = Math.round(csSecs % 60);
-          lines.push(`🎯 Velocidad Crítica (CS): ${mins}:${String(secs).padStart(2,"0")} min/km`);
-          lines.push(`   (valor API: ${cs} m/s)`);
-        } else {
-          lines.push(`🎯 CS: no configurado en la API`);
-        }
-        if (wPrime) lines.push(`🔋 D' (W'): ${wPrime} m`);
-        if (lthr)   lines.push(`❤️  LTHR: ${lthr} bpm`);
-        lines.push(`\nℹ️  Mejores marcas por distancia y predicción: usar get_best_efforts.`);
-
-        return { content: [{ type: "text", text: lines.join("\n") }] };
-      } catch (err) {
-        return { content: [{ type: "text", text: `❌ get_performance_data: ${err.message}` }] };
-      }
-    }
-  );
-
-  srv.tool("create_event",
-    "Create a workout or event in the intervals.icu calendar. Supports structured workouts with steps.",
-    {
-      date:          z.string().describe("Date YYYY-MM-DD"),
-      name:          z.string().describe("Workout name"),
-      type:          z.string().optional().describe("Run, Ride, Swim, WeightTraining, Rest (default: Run)"),
-      description:   z.string().optional().describe("Workout description text"),
-      load:          z.number().optional().describe("Target TSS/load"),
-      duration_mins: z.number().optional().describe("Planned duration in minutes"),
-      steps:         z.string().optional().describe("JSON array of workout steps. Each step: {type: 'warmup'|'steady'|'cooldown'|'rest', distance_m?: number, duration_secs?: number, pace_min?: number, pace_max?: number} where pace is seconds/km. E.g. '[{\"type\":\"warmup\",\"distance_m\":4000,\"pace_min\":300,\"pace_max\":330},{\"type\":\"steady\",\"distance_m\":11000,\"pace_min\":260,\"pace_max\":265},{\"type\":\"cooldown\",\"distance_m\":1000,\"pace_min\":340,\"pace_max\":360}]'"),
-    },
-    async ({ date, name, type = "Run", description, load, duration_mins, steps }) => {
-      try {
-        // Set correct start time: Saturday = 09:00, weekdays = 19:00
-        const startTime = dayOfWeek(date) === 6 ? "09:00:00" : "19:00:00";
-        const body = {
-          start_date_local: `${date}T${startTime}`,
-          name, type,
-          category: "WORKOUT",
-          description: description || "",
-          ...(load          && { load }),
-          ...(duration_mins && { moving_time: duration_mins * 60 }),
-        };
-
-        // Build structured workout doc if steps provided
-        if (steps) {
-          try {
-            const parsedSteps = JSON.parse(steps);
-
-            // intervals.icu workout_doc format
-            const workoutSteps = parsedSteps.map((s) => {
-              const step = {
-                type: s.type === "warmup"   ? "Warmup"
-                     : s.type === "cooldown" ? "Cooldown"
-                     : s.type === "rest"     ? "Rest"
-                     : "SteadyState",
-              };
-
-              // Length by distance or duration
-              if (s.distance_m)    step.length = { value: s.distance_m, unit: "m" };
-              else if (s.duration_secs) step.length = { value: s.duration_secs, unit: "s" };
-
-              // Pace targets (seconds/km)
-              if (s.pace_min || s.pace_max) {
-                step.pace = {};
-                if (s.pace_min) step.pace.minSecs = s.pace_min;
-                if (s.pace_max) step.pace.maxSecs = s.pace_max;
-              }
-
-              return step;
-            });
-
-            body.icu_workout_doc = { steps: workoutSteps };
-          } catch (e) {
-            // If steps parsing fails, continue without structured workout
-          }
-        }
-
-        const data = await callIntervals(`/athlete/${ATHLETE_ID}/events`, "POST", body);
-        const id   = data.id || "ok";
-        // intervals ignora a veces la duración al crear sesiones de fuerza → se fija con un PUT
-        if (data.id && duration_mins && /weight|strength/i.test(type)) {
-          try { await callIntervals(`/athlete/${ATHLETE_ID}/events/${data.id}`, "PUT", { moving_time: duration_mins * 60 }); } catch (_) {}
-        }
-        const hasStructure = !!body.icu_workout_doc;
-        return { content: [{ type: "text", text: `✅ ${date} — ${name} (${type}) [ID:${id}]${hasStructure ? " · con estructura de pasos" : ""}` }] };
-      } catch (err) {
-        return { content: [{ type: "text", text: `❌ create_event: ${err.message}` }] };
+        return { content: [{ type: "text", text: `❌ create_events: ${err.message}` }] };
       }
     }
   );
@@ -1381,6 +1374,53 @@ function createServer() {
         return { content: [{ type: "text", text: `✅ Evento ${event_id} actualizado correctamente.` }] };
       } catch (err) {
         return { content: [{ type: "text", text: `❌ update_event: ${err.message}` }] };
+      }
+    }
+  );
+
+  srv.tool("delete_event",
+    "Delete a planned event by its ID",
+    { event_id: z.string().describe("Event ID") },
+    async ({ event_id }) => {
+      try {
+        await callIntervals(`/athlete/${ATHLETE_ID}/events/${event_id}`, "DELETE");
+        return { content: [{ type: "text", text: `✅ Event ${event_id} deleted.` }] };
+      } catch (err) {
+        return { content: [{ type: "text", text: `❌ ${err.message}` }] };
+      }
+    }
+  );
+
+  srv.tool("update_activity",
+    "Write post-workout diary data to a completed activity: RPE (1-10), feel (1=muy fuerte … 5=muy flojo), name, description, or append a diary note. RPE also lets intervals.icu compute load for strength sessions without HR.",
+    {
+      activity_id: z.string().describe("Activity ID e.g. i139521833"),
+      rpe:         z.number().min(1).max(10).optional().describe("Esfuerzo percibido 1-10"),
+      feel:        z.number().min(1).max(5).optional().describe("Sensaciones: 1 muy fuerte, 2 fuerte, 3 normal, 4 flojo, 5 muy flojo"),
+      name:        z.string().optional().describe("Nuevo nombre"),
+      description: z.string().optional().describe("Sustituye la descripción completa"),
+      append_note: z.string().optional().describe("Añade una nota de diario al final de la descripción existente"),
+    },
+    async ({ activity_id, rpe, feel, name, description, append_note }) => {
+      try {
+        const body = {
+          ...(rpe  != null && { icu_rpe: Math.round(rpe) }),
+          ...(feel != null && { feel: Math.round(feel) }),
+          ...(name && { name }),
+        };
+        if (description != null) body.description = description;
+        if (append_note) {
+          const current = description != null ? description : ((await fetchActivity(activity_id))?.description || "");
+          body.description = `${current ? current + "\n\n" : ""}📝 ${append_note}`;
+        }
+        if (!Object.keys(body).length) return { content: [{ type: "text", text: "⚠️ No hay nada que actualizar." }] };
+        try { await callIntervals(`/activity/${activity_id}`, "PUT", body); }
+        catch (_) { await callIntervals(`/activity/${cleanId(activity_id)}`, "PUT", body); }
+        invalidateActivity(activity_id);
+        const parts = [rpe != null && `RPE ${rpe}`, feel != null && `feel ${feel}`, name && "nombre", (description != null || append_note) && "descripción"].filter(Boolean);
+        return { content: [{ type: "text", text: `✅ Actividad ${activity_id} actualizada: ${parts.join(", ")}` }] };
+      } catch (err) {
+        return { content: [{ type: "text", text: `❌ update_activity: ${err.message}` }] };
       }
     }
   );
@@ -1419,183 +1459,6 @@ function createServer() {
         return { content: [{ type: "text", text: `✅ Wellness updated for ${date}` }] };
       } catch (err) {
         return { content: [{ type: "text", text: `❌ ${err.message}` }] };
-      }
-    }
-  );
-
-  srv.tool("delete_event",
-    "Delete a planned event by its ID",
-    { event_id: z.string().describe("Event ID") },
-    async ({ event_id }) => {
-      try {
-        await callIntervals(`/athlete/${ATHLETE_ID}/events/${event_id}`, "DELETE");
-        return { content: [{ type: "text", text: `✅ Event ${event_id} deleted.` }] };
-      } catch (err) {
-        return { content: [{ type: "text", text: `❌ ${err.message}` }] };
-      }
-    }
-  );
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // v5 — HERRAMIENTAS NUEVAS
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  srv.tool("get_daily_briefing",
-    "ONE-CALL morning report: today's HRV vs 30-day baseline (mean ± SD), resting HR, sleep (Xh XXmin), CTL/ATL/TSB, ramp rate, today's and tomorrow's planned workouts, last activity, week-to-date km, and automatic alerts. Use this instead of calling wellness+fitness+events+activities separately.",
-    { date: z.string().optional().describe("Fecha YYYY-MM-DD (default: hoy, hora de Madrid)") },
-    async ({ date }) => {
-      try {
-        const d = date || today();
-        const wParams = new URLSearchParams({ oldest: addDays(d, -30), newest: d });
-        const [wData, evData, actData] = await Promise.all([
-          callIntervals(`/athlete/${ATHLETE_ID}/wellness?${wParams}`),
-          callIntervals(`/athlete/${ATHLETE_ID}/events?${new URLSearchParams({ oldest: d, newest: addDays(d, 1) })}`),
-          callIntervals(`/athlete/${ATHLETE_ID}/activities?${new URLSearchParams({ oldest: [addDays(d, -14), mondayOf(d)].sort()[0], newest: d })}`),
-        ]);
-        const wl   = toArray(wData, "wellness").sort((a, b) => String(a.id).localeCompare(String(b.id)));
-        const w    = wl.find(x => x.id === d) || {};
-        const prev = wl.filter(x => x.id < d);
-        const hrvHist = prev.map(x => x.hrv).filter(v => v > 0);
-        const rhrHist = prev.map(x => x.restingHR).filter(v => v > 0);
-        const hrvMu = mean(hrvHist), hrvSd = stdev(hrvHist);
-        const rhrMu = mean(rhrHist);
-        const lo = hrvMu != null && hrvSd != null ? hrvMu - hrvSd : null;
-        const hi = hrvMu != null && hrvSd != null ? hrvMu + hrvSd : null;
-
-        const loadEntry = [...wl].reverse().find(x => x.ctl != null) || {};
-        const tsb = loadEntry.ctl != null && loadEntry.atl != null ? loadEntry.ctl - loadEntry.atl : null;
-
-        const alerts = [];
-        const L = [`☀️ INFORME — ${d}`, ``, `💓 RECUPERACIÓN`];
-        if (w.hrv) {
-          const status = lo == null ? "" : w.hrv < lo ? " 🔴 POR DEBAJO del baseline" : w.hrv > hi ? " 🟢 por encima del baseline" : " 🟢 dentro del baseline";
-          L.push(`   HRV: ${w.hrv}${status}`);
-          if (lo != null && w.hrv < lo) alerts.push(`HRV ${w.hrv} por debajo del límite inferior (${Math.round(lo)})`);
-        } else L.push(`   HRV: sin dato todavía (¿reloj sincronizado?)`);
-        if (hrvMu != null) L.push(`   Baseline 30d: ${Math.round(hrvMu)} ± ${Math.round(hrvSd || 0)} (intervalo ${Math.round(lo)}–${Math.round(hi)}, n=${hrvHist.length})`);
-        if (w.restingHR) {
-          L.push(`   FC reposo: ${w.restingHR} bpm${rhrMu ? ` (media 30d ${Math.round(rhrMu)})` : ""}`);
-          if (rhrMu && w.restingHR >= rhrMu + 5) alerts.push(`FC reposo ${w.restingHR} bpm, +${Math.round(w.restingHR - rhrMu)} sobre su media`);
-        }
-        if (w.sleepSecs) {
-          L.push(`   Sueño: ${fmtSleep(w.sleepSecs)}${w.sleepScore ? ` · score ${w.sleepScore}/100` : ""}`);
-          if (w.sleepSecs < 27000) alerts.push(`Sueño ${fmtSleep(w.sleepSecs)} (< 7h 30min)`);
-        }
-        const nights = prev.slice(-6).concat(w.sleepSecs ? [w] : []).filter(x => x.sleepSecs);
-        if (nights.length >= 3) {
-          const ok = nights.filter(x => x.sleepSecs >= 27000).length;
-          L.push(`   Noches ≥7h 30min (últimos 7 días): ${ok}/${nights.length}`);
-        }
-        ["fatigue","soreness","mood","motivation"].forEach(k => { if (w[k] != null) L.push(`   ${k}: ${w[k]}`); });
-        const vo2Hist = wl.filter(x => x.vo2max > 0);
-        if (vo2Hist.length) {
-          const vNow = vo2Hist[vo2Hist.length - 1], vOld = vo2Hist[0];
-          const diff = vNow.vo2max - vOld.vo2max;
-          L.push(`   VO2max (Garmin): ${vNow.vo2max}${vNow.id !== d ? ` (dato del ${vNow.id})` : ""}${vo2Hist.length > 1 && vOld.id !== vNow.id ? ` · ${diff > 0 ? "+" : ""}${diff} desde ${vOld.id}` : ""}`);
-        }
-
-        L.push(``, `📊 CARGA`);
-        if (loadEntry.ctl != null) {
-          L.push(`   CTL ${fmt1(loadEntry.ctl)} · ATL ${fmt1(loadEntry.atl)} · TSB ${fmt1(tsb)} ${tsb > 5 ? "🟢" : tsb > -10 ? "🟡" : tsb > -25 ? "🟠" : "🔴"}`);
-          if (loadEntry.rampRate != null) L.push(`   Ramp rate: ${Number(loadEntry.rampRate).toFixed(2)}/semana`);
-          if (tsb != null && tsb < -25) alerts.push(`TSB ${fmt1(tsb)} (< -25)`);
-          if (loadEntry.rampRate != null && loadEntry.rampRate > 7) alerts.push(`Ramp rate ${Number(loadEntry.rampRate).toFixed(1)} (> 7/semana)`);
-        } else L.push(`   Sin datos de carga`);
-
-        const events = toArray(evData, "events");
-        const evLine = (e) => `   • ${e.name || "Evento"} (${e.type || e.category || "?"})${e.moving_time ? ` · ${fmtDuration(e.moving_time)}` : ""}${e.distance ? ` · ${(e.distance/1000).toFixed(1)} km` : ""} [ID:${e.id}]${e.description ? `\n${e.description.split("\n").map(x => `     ${x}`).join("\n")}` : ""}`;
-        const evToday = events.filter(e => (e.start_date_local || "").startsWith(d));
-        const evTom   = events.filter(e => (e.start_date_local || "").startsWith(addDays(d, 1)));
-        L.push(``, `📅 HOY`);
-        L.push(evToday.length ? evToday.map(evLine).join("\n") : `   Sin entrenamiento planificado`);
-        L.push(`📅 MAÑANA`);
-        L.push(evTom.length ? evTom.map(e => `   • ${e.name || "Evento"} (${e.type || e.category || "?"})`).join("\n") : `   Sin entrenamiento planificado`);
-
-        const acts = toArray(actData, "activities").sort((a, b) => String(b.start_date_local).localeCompare(String(a.start_date_local)));
-        const last = acts.find(a => (a.start_date_local || "") < `${d}T23:59:59`);
-        if (last) {
-          const dec = firstDefined(last.decoupling, last.icu_decoupling);
-          const rpe = firstDefined(last.icu_rpe, last.perceived_exertion);
-          const lastDate = (last.start_date_local||"").split("T")[0];
-          const gap = Math.round((new Date(`${d}T12:00:00Z`) - new Date(`${lastDate}T12:00:00Z`)) / 86400000);
-          L.push(``, `🏃 ÚLTIMA ACTIVIDAD — ${lastDate}${gap >= 3 ? ` (hace ${gap} días — ¿falta sincronizar?)` : ""} [ID:${last.id}]`);
-          L.push(`   ${last.name || last.type}: ${last.distance ? (last.distance/1000).toFixed(2) + " km · " : ""}${fmtDuration(last.moving_time)}${last.average_speed ? " · " + fmtPace(last.average_speed) : ""}${last.average_heartrate ? " · " + fmt0(last.average_heartrate) + " bpm" : ""}`);
-          const extra = [
-            firstDefined(last.icu_training_load, last.tss) != null ? `carga ${fmt0(firstDefined(last.icu_training_load, last.tss))}` : null,
-            dec != null ? `desacoplamiento ${fmt1(dec)}%` : null,
-            rpe != null ? `RPE ${rpe}/10` : `⚠️ sin RPE registrado`,
-          ].filter(Boolean);
-          L.push(`   ${extra.join(" · ")}`);
-        }
-
-        const monday = mondayOf(d);
-        const week = acts.filter(a => (a.start_date_local || "") >= monday && /run/i.test(a.type || ""));
-        const weekKm = week.reduce((x, a) => x + (a.distance || 0), 0) / 1000;
-        L.push(``, `📆 SEMANA (desde ${monday}): ${weekKm.toFixed(1)} km en ${week.length} sesiones de carrera`);
-
-        L.push(``, alerts.length ? `🚨 ALERTAS\n${alerts.map(x => `   • ${x}`).join("\n")}` : `✅ Sin alertas`);
-        return { content: [{ type: "text", text: L.join("\n") }] };
-      } catch (err) {
-        return { content: [{ type: "text", text: `❌ get_daily_briefing: ${err.message}` }] };
-      }
-    }
-  );
-
-  srv.tool("get_decoupling",
-    "Aerobic decoupling (Pa:HR) for a whole run or a specific km segment (e.g. the marathon-pace block of a long run). Compares efficiency (speed/HR) between the two halves. <5% = coupled, 5-8% moderate drift, >8% high drift.",
-    {
-      activity_id: z.string().describe("Activity ID e.g. i139521833"),
-      from_km: z.number().optional().describe("Inicio del tramo en km (ej: 20)"),
-      to_km:   z.number().optional().describe("Fin del tramo en km (ej: 30)"),
-    },
-    async ({ activity_id, from_km, to_km }) => {
-      try {
-        const st = await fetchStreams(activity_id, "time,heartrate,velocity_smooth,distance");
-        const r = computeDecoupling(st, from_km != null ? from_km * 1000 : null, to_km != null ? to_km * 1000 : null);
-        if (!r) return { content: [{ type: "text", text: "⚠️ No hay datos suficientes de FC/ritmo en ese tramo (mínimo ~10 min)." }] };
-        const L = [
-          `🫀 DESACOPLAMIENTO Pa:HR — ${activity_id}${r.km ? ` · tramo ${r.km}` : ""}`,
-          `   1ª mitad: ${r.first.pace} @ ${r.first.hr} bpm`,
-          `   2ª mitad: ${r.second.pace} @ ${r.second.hr} bpm`,
-          `   Desacoplamiento: ${fmt1(r.decoupling)}%`,
-          `   ${r.rating}`,
-        ];
-        return { content: [{ type: "text", text: L.join("\n") }] };
-      } catch (err) {
-        return { content: [{ type: "text", text: `❌ get_decoupling: ${err.message}` }] };
-      }
-    }
-  );
-
-  srv.tool("update_activity",
-    "Write post-workout diary data to a completed activity: RPE (1-10), feel (1=muy fuerte … 5=muy flojo), name, description, or append a diary note. RPE also lets intervals.icu compute load for strength sessions without HR.",
-    {
-      activity_id: z.string().describe("Activity ID e.g. i139521833"),
-      rpe:         z.number().min(1).max(10).optional().describe("Esfuerzo percibido 1-10"),
-      feel:        z.number().min(1).max(5).optional().describe("Sensaciones: 1 muy fuerte, 2 fuerte, 3 normal, 4 flojo, 5 muy flojo"),
-      name:        z.string().optional().describe("Nuevo nombre"),
-      description: z.string().optional().describe("Sustituye la descripción completa"),
-      append_note: z.string().optional().describe("Añade una nota de diario al final de la descripción existente"),
-    },
-    async ({ activity_id, rpe, feel, name, description, append_note }) => {
-      try {
-        const body = {
-          ...(rpe  != null && { icu_rpe: Math.round(rpe) }),
-          ...(feel != null && { feel: Math.round(feel) }),
-          ...(name && { name }),
-        };
-        if (description != null) body.description = description;
-        if (append_note) {
-          const current = description != null ? description : ((await fetchActivity(activity_id))?.description || "");
-          body.description = `${current ? current + "\n\n" : ""}📝 ${append_note}`;
-        }
-        if (!Object.keys(body).length) return { content: [{ type: "text", text: "⚠️ No hay nada que actualizar." }] };
-        try { await callIntervals(`/activity/${activity_id}`, "PUT", body); }
-        catch (_) { await callIntervals(`/activity/${cleanId(activity_id)}`, "PUT", body); }
-        const parts = [rpe != null && `RPE ${rpe}`, feel != null && `feel ${feel}`, name && "nombre", (description != null || append_note) && "descripción"].filter(Boolean);
-        return { content: [{ type: "text", text: `✅ Actividad ${activity_id} actualizada: ${parts.join(", ")}` }] };
-      } catch (err) {
-        return { content: [{ type: "text", text: `❌ update_activity: ${err.message}` }] };
       }
     }
   );
@@ -1658,83 +1521,6 @@ function createServer() {
     }
   );
 
-  srv.tool("create_events_bulk",
-    "Create a whole week (or more) of workouts in ONE call. Each event: date, name, type (Run/WeightTraining/…), description in intervals.icu workout text format, optional duration_mins, distance_km, load, time (HH:MM). Default time: Saturday 09:00, other days 19:00. Strength-session duration is fixed automatically.",
-    {
-      events: z.array(z.object({
-        date:          z.string().describe("YYYY-MM-DD"),
-        name:          z.string(),
-        type:          z.string().optional().describe("Run (default), WeightTraining, Ride, Swim…"),
-        description:   z.string().optional().describe("Estructura del entreno en formato intervals.icu"),
-        duration_mins: z.number().optional(),
-        distance_km:   z.number().optional(),
-        load:          z.number().optional(),
-        time:          z.string().optional().describe("HH:MM para sobrescribir la hora por defecto"),
-      })).min(1).max(30),
-    },
-    async ({ events }) => {
-      try {
-        const bodies = events.map(e => {
-          const t = e.time ? `${e.time}:00` : (dayOfWeek(e.date) === 6 ? "09:00:00" : "19:00:00");
-          return {
-            start_date_local: `${e.date}T${t}`,
-            name: e.name,
-            type: e.type || "Run",
-            category: "WORKOUT",
-            description: e.description || "",
-            ...(e.duration_mins && { moving_time: e.duration_mins * 60 }),
-            ...(e.distance_km   && { distance: Math.round(e.distance_km * 1000) }),
-            ...(e.load          && { load: e.load }),
-          };
-        });
-        const res = await callIntervals(`/athlete/${ATHLETE_ID}/events/bulk`, "POST", bodies);
-        const created = Array.isArray(res) ? res : toArray(res, "events");
-
-        // intervals devuelve los eventos ordenados por fecha → emparejar por fecha + nombre, nunca por posición
-        const pool = [...created];
-        const matched = events.map(e => {
-          const k = pool.findIndex(c => (c.start_date_local || "").startsWith(e.date) && c.name === e.name);
-          return k === -1 ? null : pool.splice(k, 1)[0];
-        });
-
-        // Fijar duración de las sesiones de fuerza
-        await Promise.all(events.map(async (e, i) => {
-          const c = matched[i];
-          if (c?.id && e.duration_mins && /weight|strength/i.test(e.type || "")) {
-            try { await callIntervals(`/athlete/${ATHLETE_ID}/events/${c.id}`, "PUT", { moving_time: e.duration_mins * 60 }); } catch (_) {}
-          }
-        }));
-
-        const L = [`✅ ${created.length || events.length} eventos creados`];
-        events.forEach((e, i) => L.push(`   ${e.date} — ${e.name} (${e.type || "Run"})${matched[i]?.id ? ` [ID:${matched[i].id}]` : ""}`));
-        return { content: [{ type: "text", text: L.join("\n") }] };
-      } catch (err) {
-        return { content: [{ type: "text", text: `❌ create_events_bulk: ${err.message}` }] };
-      }
-    }
-  );
-
-  srv.tool("get_gear",
-    "List gear (shoes) with accumulated km, time and number of activities. Useful to track race-shoe mileage.",
-    { include_retired: z.boolean().optional().describe("Incluir material retirado (default: false)") },
-    async ({ include_retired = false }) => {
-      try {
-        const data = await callIntervals(`/athlete/${ATHLETE_ID}/gear`);
-        const gear = toArray(data, "gear").filter(g => include_retired || !g.retired);
-        if (!gear.length) return { content: [{ type: "text", text: "No hay material registrado en intervals.icu (Settings → Gear, o sincronizado desde Garmin/Strava)." }] };
-        gear.sort((a, b) => (b.distance || 0) - (a.distance || 0));
-        const L = [`👟 MATERIAL`];
-        gear.forEach(g => {
-          L.push(`   • ${g.name || "Sin nombre"}${g.type ? ` (${g.type})` : ""}${g.retired ? " [retirado]" : ""}`);
-          L.push(`     ${fmt0((g.distance || 0) / 1000)} km${g.time ? ` · ${fmtDuration(g.time)}` : ""}${g.activities ? ` · ${g.activities} actividades` : ""}`);
-        });
-        return { content: [{ type: "text", text: L.join("\n") }] };
-      } catch (err) {
-        return { content: [{ type: "text", text: `❌ get_gear: ${err.message}` }] };
-      }
-    }
-  );
-
   srv.tool("get_best_efforts",
     "Best efforts over standard distances (1k, 3k, 5k, 10k, 15k, half, 30k) computed from recent run streams, plus Riegel marathon predictions from the 10k and half. Slow (~10-30 s): use for monthly load reviews or after races, not daily.",
     {
@@ -1786,176 +1572,21 @@ function createServer() {
     }
   );
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // v6 — INDICADOR DE RITMO MARATÓN + PROYECCIÓN DE CARGA
-  // ═══════════════════════════════════════════════════════════════════════════
-
   srv.tool("get_mp_trend",
-    "Marathon-pace readiness indicator: finds every continuous segment run inside a grade-adjusted pace band (default 4:05-4:25/km) over the last N days and reports, per segment, pace, HR, HR normalised to the target pace, decoupling, elevation and the km where it started (fatigue context). Returns the trend of the HR cost of marathon pace. Slow (10-30 s): use in Sunday reviews, not daily.",
+    "Marathon-pace readiness indicator: every continuous segment inside a grade-adjusted pace band (default 4:05-4:25/km) over the last N days, with pace, HR, HR normalised to the target pace, decoupling, elevation and start km (fatigue context), plus the trend of the HR cost of marathon pace. Cached per activity: only new runs are processed.",
     {
-      target_pace:   z.string().optional().describe("Ritmo objetivo m:ss/km para normalizar la FC (default: 4:16)"),
-      pace_fast:     z.string().optional().describe("Límite rápido de la banda m:ss/km, en ritmo ajustado a pendiente (default: 4:05)"),
-      pace_slow:     z.string().optional().describe("Límite lento de la banda m:ss/km, en ritmo ajustado a pendiente (default: 4:25)"),
-      days:          z.number().optional().describe("Días hacia atrás (default: 90, máx: 180)"),
-      min_km:        z.number().optional().describe("Longitud mínima del tramo en km (default: 2)"),
+      target_pace: z.string().optional().describe("Ritmo objetivo m:ss/km (default: 4:16)"),
+      pace_fast:   z.string().optional().describe("Límite rápido de la banda m:ss/km, ritmo GAP (default: 4:05)"),
+      pace_slow:   z.string().optional().describe("Límite lento de la banda m:ss/km, ritmo GAP (default: 4:25)"),
+      days:        z.number().optional().describe("Días hacia atrás (default: 90, máx: 180)"),
+      min_km:      z.number().optional().describe("Longitud mínima del tramo en km (default: 2)"),
       include_treadmill: z.boolean().optional().describe("Incluir cinta/VirtualRun (default: false)"),
     },
-    async ({ target_pace = "4:16", pace_fast = "4:05", pace_slow = "4:25", days = 90, min_km = 2, include_treadmill = false }) => {
+    async (args) => {
       try {
-        const vT = paceStrToMps(target_pace), vF = paceStrToMps(pace_fast), vS = paceStrToMps(pace_slow);
-        if (!vT || !vF || !vS || vF <= vS) return { content: [{ type: "text", text: "❌ Ritmos no válidos (formato m:ss, pace_fast más rápido que pace_slow)." }] };
-        // Tolerancia de 4 s/km en los bordes de la banda
-        const vHi = 1000 / (1000 / vF - 4), vLo = 1000 / (1000 / vS + 4);
-        const nDays = Math.min(days, 180);
-        const params = new URLSearchParams({ oldest: daysAgo(nDays), newest: today() });
-        const acts = toArray(await callIntervals(`/athlete/${ATHLETE_ID}/activities?${params}`), "activities")
-          .filter(a => (a.type === "Run" || (include_treadmill && a.type === "VirtualRun")) && (a.distance || 0) >= min_km * 1000 && !(a.trainer && !include_treadmill))
-          .filter(a => { const sp = a.average_speed || 0; return sp === 0 || sp > vLo * 0.75; }) // descarta rodajes muy lentos sin opción de tramo
-          .sort((a, b) => String(a.start_date_local).localeCompare(String(b.start_date_local)));
-
-        const segs = [];
-        const failed = [];
-        const inBandSp = (sp) => sp >= vLo && sp <= vHi;
-        const tOfSt = (st, x) => st.time.length ? st.time[x] : x;
-
-        // Métricas de un tramo [start..last] a partir de los streams (GAP, FC sin retardo, desnivel, desacoplamiento)
-        const enrich = (st, gv, start, last) => {
-          const { hr, dist, alt } = st;
-          const segM = (dist[last] || 0) - (dist[start] || 0);
-          const secs = tOfSt(st, last) - tOfSt(st, start);
-          if (segM <= 0 || secs <= 0) return null;
-          const hrFrom = secs > 300 ? start + Math.min(90, Math.floor((last - start) / 4)) : start;
-          const hrVals = []; for (let x = hrFrom; x <= last; x++) if (hr[x] > 60) hrVals.push(hr[x]);
-          const gVals = []; for (let x = start; x <= last; x++) gVals.push(gv[x]);
-          let up = 0;
-          if (alt.length) { for (let x = start + 10; x <= last; x += 10) { const dz = (alt[x] || 0) - (alt[x - 10] || 0); if (dz > 0) up += dz; } }
-          const dec = secs >= 1200 ? computeDecoupling({ ...st, vel: gv }, dist[start], dist[last]) : null;
-          return { startKm: (dist[start] || 0) / 1000, km: segM / 1000, v: segM / secs, vg: mean(gVals) || segM / secs,
-                   hr: hrVals.length >= 60 ? mean(hrVals) : null, up, dec: dec ? dec.decoupling : null };
-        };
-
-        const pushSeg = (a, m, src) => {
-          if (!m || !m.hr) return;
-          segs.push({ date: (a.start_date_local || "").split("T")[0], name: a.name || "", src,
-                      startKm: m.startKm, km: m.km, pace: 1000 / m.v, gap: 1000 / m.vg, hr: m.hr,
-                      hrNorm: m.hr * (vT / m.vg), dec: m.dec, up: m.up });
-        };
-
-        for (let i = 0; i < acts.length; i += 3) {
-          const batch = acts.slice(i, i + 3);
-          await Promise.all(batch.map(async (a) => {
-            // ── 1) Intervalos de intervals (pasos del entreno estructurado o vueltas) ──
-            let ivs = [], ivErr = null;
-            try {
-              let raw;
-              try { raw = await callIntervals(`/activity/${a.id}/intervals`); }
-              catch (e) { if (!/ 404/.test(e.message)) throw e; raw = await callIntervals(`/activity/${cleanId(a.id)}/intervals`); }
-              ivs = (raw?.icu_intervals || []).filter(iv => (iv.distance || 0) > 0 && (iv.moving_time || iv.elapsed_time || 0) > 0);
-            } catch (e) { if (!/ 404/.test(e.message)) ivErr = e; }
-            ivs.sort((x, y) => (x.start_index ?? 0) - (y.start_index ?? 0));
-
-            // Agrupar intervalos consecutivos dentro de la banda
-            const groups = []; let cur = null, before = 0; const startDist = [];
-            ivs.forEach(iv => {
-              startDist.push(before); before += iv.distance || 0;
-              const sp = iv.average_speed || (iv.distance / (iv.moving_time || iv.elapsed_time));
-              if (inBandSp(sp)) { (cur = cur || []).push(iv); } else { if (cur) groups.push(cur); cur = null; }
-            });
-            if (cur) groups.push(cur);
-            const cands = groups.map(g => {
-              const dist = g.reduce((s, iv) => s + (iv.distance || 0), 0);
-              const secs = g.reduce((s, iv) => s + (iv.moving_time || iv.elapsed_time || 0), 0);
-              const hrW  = g.reduce((s, iv) => s + (iv.average_heartrate || 0) * (iv.moving_time || iv.elapsed_time || 0), 0);
-              return { dist, secs, hr: secs ? hrW / secs : null, startIdx: g[0].start_index, endIdx: g[g.length - 1].end_index,
-                       startKm: startDist[ivs.indexOf(g[0])] / 1000 };
-            }).filter(c => c.dist >= min_km * 1000);
-
-            let st = null, gv = null;
-            const loadStreams = async () => {
-              if (st) return st;
-              try {
-                st = await fetchStreams(a.id, "time,heartrate,velocity_smooth,distance,altitude");
-                gv = gapVelocity(st.vel, st.dist, st.alt);
-              } catch (_) { st = null; }
-              return st;
-            };
-
-            if (cands.length) {
-              await loadStreams();
-              for (const c of cands) {
-                const n = st ? Math.min(st.vel.length, st.dist.length) : 0;
-                const hasIdx = st && c.startIdx != null && c.endIdx != null && c.endIdx < n && c.endIdx > c.startIdx;
-                const m = hasIdx ? enrich(st, gv, c.startIdx, c.endIdx) : null;
-                if (m) {
-                  // Distancia y ritmo exactos del intervalo; GAP, FC sin retardo y desacoplamiento de los streams
-                  pushSeg(a, { ...m, km: c.dist / 1000, v: c.dist / c.secs, hr: m.hr ?? c.hr }, "int");
-                } else {
-                  pushSeg(a, { startKm: c.startKm, km: c.dist / 1000, v: c.dist / c.secs, vg: c.dist / c.secs, hr: c.hr, up: 0, dec: null }, "int");
-                }
-              }
-              return;
-            }
-
-            // ── 2) Respaldo: detección sobre los streams (carreras sin vueltas útiles) ──
-            if (!await loadStreams()) { failed.push((a.start_date_local || "").split("T")[0]); return; }
-            if (ivErr) failed.push(`${(a.start_date_local || "").split("T")[0]} (solo GPS)`);
-            const n = Math.min(st.vel.length, st.dist.length);
-            if (n < 300 || !st.hr.length) return;
-            const rv = new Array(n); let acc = 0;
-            for (let k = 0; k < n; k++) { acc += gv[k] || 0; if (k >= 60) acc -= gv[k - 60] || 0; rv[k] = acc / Math.min(k + 1, 60); }
-            let k = 0;
-            while (k < n) {
-              if (!inBandSp(rv[k])) { k++; continue; }
-              let start = k, last = k, gap = 0; k++;
-              while (k < n) { if (inBandSp(rv[k])) { last = k; gap = 0; } else if (++gap > 45) break; k++; }
-              if ((st.dist[last] || 0) - (st.dist[start] || 0) < min_km * 1000) continue;
-              pushSeg(a, enrich(st, gv, start, last), "gps");
-            }
-          }));
-        }
-        segs.sort((x, y) => x.date.localeCompare(y.date) || x.startKm - y.startKm);
-        const failNote = failed.length ? `\n⚠️ ${failed.length} actividad(es) no se pudieron leer completas: ${failed.join(", ")}. Repetir la consulta en unos minutos.` : "";
-        if (!segs.length) return { content: [{ type: "text", text: failNote + `\nNo hay tramos de ≥${min_km} km entre ${pace_fast} y ${pace_slow}/km en los últimos ${nDays} días.` }] };
-
-        const L = [`🎯 COSTE CARDÍACO DEL RITMO MARATÓN — banda ${pace_fast}-${pace_slow}/km · normalizado a ${target_pace}`,
-                   `   ${segs.length} tramos en ${new Set(segs.map(s => s.date)).size} sesiones (últimos ${nDays} días)`, ``,
-                   `fecha      | inicio | tramo  | ritmo | GAP  | FC  | FC@${target_pace} | desac | desn+`];
-        segs.slice(-25).forEach(s => {
-          const fat = s.startKm >= 15 ? "🔋" : "  ";
-          const srcMark = s.src === "gps" ? "*" : " ";
-          L.push(`${s.date}${srcMark}| ${fat}${s.startKm.toFixed(1).padStart(4)} | ${s.km.toFixed(1).padStart(4)}km | ${fmtSecs(s.pace)} | ${fmtSecs(s.gap)} | ${Math.round(s.hr)} | ${Math.round(s.hrNorm).toString().padStart(3)}     | ${s.dec != null ? fmt1(s.dec).padStart(4) + "%" : "   - "} | ${Math.round(s.up)}m`);
-        });
-        L.push(`   🔋 = tramo iniciado a partir del km 15 (con fatiga acumulada) · * = detectado por GPS (sin vueltas), menos preciso`);
-
-        // Tendencia: regresión ponderada por km de la FC normalizada frente al tiempo
-        const t0 = new Date(`${segs[0].date}T12:00:00Z`).getTime();
-        const xs = segs.map(s => (new Date(`${s.date}T12:00:00Z`).getTime() - t0) / 86400000);
-        const ws = segs.map(s => s.km), ys = segs.map(s => s.hrNorm);
-        const W = ws.reduce((a, b) => a + b, 0);
-        const mx = xs.reduce((a, x, i) => a + x * ws[i], 0) / W, my = ys.reduce((a, y, i) => a + y * ws[i], 0) / W;
-        const sxx = xs.reduce((a, x, i) => a + ws[i] * (x - mx) ** 2, 0);
-        const slope = sxx > 0 ? xs.reduce((a, x, i) => a + ws[i] * (x - mx) * (ys[i] - my), 0) / sxx : 0;
-        const wavg = (arr) => { const w = arr.reduce((a, s) => a + s.km, 0); return w ? arr.reduce((a, s) => a + s.hrNorm * s.km, 0) / w : null; };
-        const cut = daysAgo(28);
-        const recent = segs.filter(s => s.date >= cut), older = segs.filter(s => s.date < cut);
-        const fresh = recent.filter(s => s.startKm < 15), tired = recent.filter(s => s.startKm >= 15);
-        const decs = recent.filter(s => s.dec != null).map(s => s.dec);
-
-        const nSessions = new Set(segs.map(s => s.date)).size;
-        const span = xs[xs.length - 1] - xs[0];
-        L.push(``, `📉 TENDENCIA`);
-        if (nSessions >= 3 && span >= 21) {
-          L.push(`   FC a ${target_pace}: ${slope <= 0 ? "▼" : "▲"} ${Math.abs(slope * 28).toFixed(1)} bpm cada 4 semanas ${slope < -0.5 / 28 ? "🟢 (mejorando)" : slope > 0.5 / 28 ? "🔴 (empeorando)" : "🟡 (estable)"}`);
-        } else {
-          L.push(`   ⚠️ Datos insuficientes para una tendencia fiable (${nSessions} sesiones en ${Math.round(span)} días; mínimo 3 sesiones en 21 días)`);
-        }
-        if (older.length && recent.length) L.push(`   Últimas 4 semanas: ${Math.round(wavg(recent))} bpm · antes: ${Math.round(wavg(older))} bpm`);
-        if (fresh.length && tired.length) L.push(`   Últimas 4 semanas — fresco: ${Math.round(wavg(fresh))} bpm · con fatiga (km 15+): ${Math.round(wavg(tired))} bpm (${wavg(tired) >= wavg(fresh) ? "+" : ""}${Math.round(wavg(tired) - wavg(fresh))})`);
-        if (decs.length) L.push(`   Desacoplamiento medio (tramos ≥20 min, últimas 4 semanas): ${fmt1(mean(decs))}%`);
-        L.push(`   Km a ritmo maratón últimas 4 semanas: ${recent.reduce((a, s) => a + s.km, 0).toFixed(1)} km · tramo más largo: ${Math.max(...recent.map(s => s.km), 0).toFixed(1)} km`);
-        L.push(``, `ℹ️ Tramos tomados de los intervalos de intervals (o del GPS si no hay vueltas). FC@objetivo = FC × velocidad objetivo / velocidad GAP. Contrastar siempre con calor y sueño del día.`);
-        if (failNote) L.push(failNote);
-        return { content: [{ type: "text", text: L.join("\n") }] };
+        const r = await computeMpTrend(args);
+        if (r.error) return { content: [{ type: "text", text: r.error }] };
+        return { content: [{ type: "text", text: mpTrendLines(r, { table: true }).join("\n") }] };
       } catch (err) {
         return { content: [{ type: "text", text: `❌ get_mp_trend: ${err.message}` }] };
       }
@@ -2219,9 +1850,10 @@ app.delete(MCP_PATHS, requireAuth, async (req, res) => {
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/health", (_, res) => res.json({
-  status: "ok", version: "6.5.0", transport: "streamable-http", sessions: sessions.size, auth: !!AUTH_TOKEN
+  status: "ok", version: "7.0.0", transport: "streamable-http", sessions: sessions.size, auth: !!AUTH_TOKEN,
+  cache: { streams: streamCache.size, data: dataCache.size, hits: streamCache.hits + dataCache.hits, misses: streamCache.miss + dataCache.miss }
 }));
 
 app.listen(PORT, () => {
-  console.log(`✅ Intervals MCP v6.5 (Streamable HTTP) — port ${PORT} — athlete ${ATHLETE_ID} — ${AUTH_TOKEN ? "🔒 token activo" : "⚠️ SIN token: endpoint abierto"}`);
+  console.log(`✅ Intervals MCP v7.0 (Streamable HTTP, 18 herramientas) — port ${PORT} — athlete ${ATHLETE_ID} — ${AUTH_TOKEN ? "🔒 token activo" : "⚠️ SIN token: endpoint abierto"}`);
 });
