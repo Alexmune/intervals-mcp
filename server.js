@@ -375,6 +375,7 @@ function invalidateActivity(activity_id) {
 // ─── Utilidades de ritmo ─────────────────────────────────────────────────────
 const paceToSecs = (s) => { const m = String(s).trim().match(/^(\d{1,2}):(\d{2})$/); return m ? +m[1] * 60 + +m[2] : null; };
 const pS = (mps) => (mps > 0 ? fmtSecs(1000 / mps) : "-");            // m/s → "m:ss"
+const kmBuckets = (m) => { const t = m || 0; const n = Math.ceil(t / 1000); return Math.max(1, t - (n - 1) * 1000 < 100 ? n - 1 : n); };
 const actDate = (a) => (a.start_date_local || a.date || "").split("T")[0];
 const isRun = (a) => /run/i.test(a.type || "");
 const DOW = ["Dom", "Lun", "Mar", "Mié", "Jue", "Vie", "Sáb"];
@@ -417,6 +418,10 @@ function parseWorkoutText(text) {
   return out;
 }
 const isRestStep = (s) => /recovery|rest|warmup|cooldown/.test(s.intensity);
+const ivSecs = (iv) => iv.moving_time || iv.elapsed_time || 0;
+// Intervalos útiles: con distancia y ≥10 s (Garmin mete fragmentos de 1 s al pulsar vuelta)
+const usefulIntervals = (arr) => (arr || []).filter(iv => (iv.distance || 0) > 0 && ivSecs(iv) >= 10)
+  .sort((x, y) => (x.start_index ?? 0) - (y.start_index ?? 0));
 const plannedKm = (e) => {
   if (e.distance > 0) return e.distance / 1000;
   const st = parseWorkoutText(e.description);
@@ -426,22 +431,31 @@ const plannedKm = (e) => {
 // ─── Cumplimiento repetición a repetición ────────────────────────────────────
 // Empareja los intervalos registrados con los pasos del entreno planificado.
 function repCompliance(ivsRaw, steps) {
-  const ivs = (ivsRaw || []).filter(iv => (iv.distance || 0) > 0 && (iv.moving_time || iv.elapsed_time || 0) > 0)
-    .sort((x, y) => (x.start_index ?? 0) - (y.start_index ?? 0));
+  const ivs = usefulIntervals(ivsRaw);
   const targets = steps.filter(s => !isRestStep(s) && s.fast != null);
   if (!ivs.length || !targets.length) return null;
   const work = ivs.filter(iv => String(iv.type || "").toUpperCase() === "WORK");
-  let pairs, mode;
-  if (ivs.length === steps.length) {
-    pairs = ivs.map((iv, i) => ({ iv, st: steps[i] })).filter(p => !isRestStep(p.st) && p.st.fast != null); mode = "exacto";
+  let pairs = [], mode;
+  // a) Alineación secuencial: cada paso con el siguiente intervalo de duración/distancia parecida
+  //    (tolera vueltas extra al final o en medio)
+  const fits = (iv, st) => st.secs ? Math.abs(ivSecs(iv) - st.secs) <= Math.max(10, st.secs * 0.15)
+                         : st.meters ? Math.abs(iv.distance - st.meters) <= Math.max(100, st.meters * 0.1) : false;
+  let j = 0; const seq = [];
+  for (const st of steps) {
+    let k = j;
+    while (k < ivs.length && k <= j + 2 && !fits(ivs[k], st)) k++;
+    if (k < ivs.length && k <= j + 2) { seq.push({ iv: ivs[k], st }); j = k + 1; } else break;
+  }
+  if (seq.length === steps.length) {
+    pairs = seq.filter(p => !isRestStep(p.st) && p.st.fast != null); mode = "exacto";
   } else if (work.length === targets.length) {
     pairs = work.map((iv, i) => ({ iv, st: targets[i] })); mode = "por bloques de trabajo";
   } else {
-    // Aproximado: cada intervalo de trabajo con el objetivo más cercano (±25 s/km)
-    const cand = (work.length ? work : ivs.filter(iv => (iv.moving_time || iv.elapsed_time) >= 60));
+    // c) Aproximado: cada intervalo de trabajo con el objetivo más cercano (±25 s/km)
+    const cand = (work.length ? work : ivs.filter(iv => ivSecs(iv) >= 60));
     const uniq = [...new Map(targets.map(t => [`${t.fast}-${t.slow}`, t])).values()];
     pairs = cand.map(iv => {
-      const p = 1000 / (iv.average_speed || iv.distance / (iv.moving_time || iv.elapsed_time));
+      const p = 1000 / (iv.average_speed || iv.distance / ivSecs(iv));
       const st = uniq.map(t => ({ t, d: p < t.fast ? t.fast - p : p > t.slow ? p - t.slow : 0 })).sort((a, b) => a.d - b.d)[0];
       return st && st.d <= 25 ? { iv, st: st.t } : null;
     }).filter(Boolean);
@@ -518,9 +532,8 @@ async function computeMpSegments(a, band) {
 
   // 1) Intervalos de intervals (pasos del entreno estructurado o vueltas)
   let ivs = [], ivErr = null;
-  try { ivs = ((await fetchIntervals(a.id))?.icu_intervals || []).filter(iv => (iv.distance || 0) > 0 && (iv.moving_time || iv.elapsed_time || 0) > 0); }
+  try { ivs = usefulIntervals((await fetchIntervals(a.id))?.icu_intervals); }
   catch (e) { ivErr = e; }
-  ivs.sort((x, y) => (x.start_index ?? 0) - (y.start_index ?? 0));
   const groups = []; let cur = null, before = 0; const startDist = [];
   ivs.forEach(iv => {
     startDist.push(before); before += iv.distance || 0;
@@ -545,9 +558,11 @@ async function computeMpSegments(a, band) {
   if (cands.length) {
     await load();
     for (const c of cands) {
-      const n = st ? Math.min(st.vel.length, st.dist.length) : 0;
-      const ok = st && c.startIdx != null && c.endIdx != null && c.endIdx < n && c.endIdx > c.startIdx;
-      const m = ok ? segMetrics(st, gv, c.startIdx, c.endIdx) : null;
+      const n = st ? Math.min(st.vel.length, st.dist.length, st.hr.length || Infinity) : 0;
+      // El último intervalo suele acabar en el último punto (o uno más): se acota al stream
+      const end = c.endIdx != null && c.endIdx >= n && c.endIdx - n < 60 ? n - 1 : c.endIdx;
+      const ok = st && c.startIdx != null && end != null && end < n && end > c.startIdx;
+      const m = ok ? segMetrics(st, gv, c.startIdx, end) : null;
       if (m) push({ ...m, km: c.dist / 1000, v: c.dist / c.secs, hr: m.hr ?? c.hr }, "int");
       else push({ startKm: c.startKm, km: c.dist / 1000, v: c.dist / c.secs, vg: c.dist / c.secs, hr: c.hr, up: 0, dec: null }, "int");
     }
@@ -712,7 +727,7 @@ function assessReadiness({ d, wl, sessionType, yRpe }) {
 
 // ─── MCP Server factory ───────────────────────────────────────────────────────
 function createServer() {
-  const srv = new McpServer({ name: "intervals-mcp", version: "7.0.0" });
+  const srv = new McpServer({ name: "intervals-mcp", version: "7.1.0" });
 
   srv.tool("get_daily_briefing",
     "ONE-CALL morning report with a readiness traffic light (green/amber/red + concrete action for today's planned session, from HRV vs range, 7-day HRV trend, resting HR, sleep, TSB and yesterday's RPE), plus today's HRV vs 30-day baseline (mean ± SD), resting HR, sleep (Xh XXmin), CTL/ATL/TSB, ramp rate, today's and tomorrow's planned workouts, last activity, week-to-date km, and automatic alerts. Use this instead of calling wellness+fitness+events+activities separately.",
@@ -916,7 +931,7 @@ function createServer() {
           if (whole) L.push(`🫀 Desacoplamiento global: ${fmt1(whole.decoupling)}% ${whole.decoupling < 5 ? "🟢" : whole.decoupling < 8 ? "🟡" : "🔴"} (1ª mitad ${whole.first.pace.replace(" min/km", "")} @ ${whole.first.hr} · 2ª ${whole.second.pace.replace(" min/km", "")} @ ${whole.second.hr})`);
 
           if (splits && st.dist.length) {
-            const n = Math.ceil((st.dist[st.dist.length - 1] || 0) / 1000);
+            const n = kmBuckets(st.dist[st.dist.length - 1]);
             const b = Array.from({ length: n }, () => ({ v: [], h: [] }));
             for (let i = 0; i < st.dist.length; i++) {
               const k = Math.min(Math.floor((st.dist[i] || 0) / 1000), n - 1);
@@ -1177,7 +1192,7 @@ function createServer() {
           return { content: [{ type: "text", text: `🫀 Desacoplamiento${r.km ? ` km ${r.km}` : ""}: ${fmt1(r.decoupling)}% · 1ª mitad ${r.first.pace} @ ${r.first.hr} · 2ª ${r.second.pace} @ ${r.second.hr}\n   ${r.rating}` }] };
         }
         const { time, hr, vel, dist, cad, alt } = st;
-        const n = Math.ceil((dist[dist.length - 1] || 0) / 1000);
+        const n = kmBuckets(dist[dist.length - 1]);
         const b = Array.from({ length: n }, () => ({ v: [], h: [], c: [], a0: null, a1: null }));
         for (let i = 0; i < dist.length; i++) {
           const k = Math.min(Math.floor((dist[i] || 0) / 1000), n - 1);
@@ -1850,10 +1865,10 @@ app.delete(MCP_PATHS, requireAuth, async (req, res) => {
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/health", (_, res) => res.json({
-  status: "ok", version: "7.0.0", transport: "streamable-http", sessions: sessions.size, auth: !!AUTH_TOKEN,
+  status: "ok", version: "7.1.0", transport: "streamable-http", sessions: sessions.size, auth: !!AUTH_TOKEN,
   cache: { streams: streamCache.size, data: dataCache.size, hits: streamCache.hits + dataCache.hits, misses: streamCache.miss + dataCache.miss }
 }));
 
 app.listen(PORT, () => {
-  console.log(`✅ Intervals MCP v7.0 (Streamable HTTP, 18 herramientas) — port ${PORT} — athlete ${ATHLETE_ID} — ${AUTH_TOKEN ? "🔒 token activo" : "⚠️ SIN token: endpoint abierto"}`);
+  console.log(`✅ Intervals MCP v7.1 (Streamable HTTP, 18 herramientas) — port ${PORT} — athlete ${ATHLETE_ID} — ${AUTH_TOKEN ? "🔒 token activo" : "⚠️ SIN token: endpoint abierto"}`);
 });

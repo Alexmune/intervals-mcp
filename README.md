@@ -39,6 +39,12 @@ Si `MCP_AUTH_TOKEN` está definido, `/sse` sin token devuelve 401. También se a
 
 ---
 
+## Novedades v7.1.0
+- Cumplimiento por repetición: alineación secuencial paso a paso por duración/distancia; tolera vueltas extra y fragmentos de Garmin (modo "exacto" en fartleks reales).
+- Intervalos de menos de 10 s descartados en todos los análisis.
+- Tramos a ritmo maratón que terminan al final de la actividad: el índice final se acota al stream (vuelven desacoplamiento y desnivel).
+- Splits: un último km parcial de menos de 100 m se suma al anterior.
+
 ## Novedades v7.0.0
 - **Ahorro de cuota**: 18 herramientas (antes 29) y análisis completos en una sola llamada.
 - `get_post_workout_report`: análisis post-entreno completo (métricas, GAP, plan vs hecho, zonas, cumplimiento repetición a repetición contra los ritmos del entreno planificado, bloque a ritmo maratón con FC@4:16 y desacoplamiento, splits compactos, RPE/sensaciones).
