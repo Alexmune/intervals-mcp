@@ -391,6 +391,47 @@ function parseLenToken(tok) {
     return { secs: (+(m[1] || 0)) * 3600 + (+(m[2] || 0)) * 60 + (+(m[3] || 0)) };
   return {};
 }
+// Objetivos de FC: "Z2 HR" · "Z1-Z2 HR" · "140-150bpm" · "75-85% LTHR" · "70-80% HR" (% FC máx)
+function parseHrTarget(body) {
+  let m;
+  if ((m = body.match(/\bZ(\d)\s*(?:-\s*Z?(\d))?\s+HR\b/i))) {
+    const a = +m[1], b = m[2] ? +m[2] : a;
+    return { hr: { kind: "zone", from: Math.min(a, b), to: Math.max(a, b), label: a === b ? `Z${a}` : `Z${Math.min(a, b)}-Z${Math.max(a, b)}` } };
+  }
+  if ((m = body.match(/(\d{2,3})\s*(?:-\s*(\d{2,3}))?\s*bpm/i))) {
+    const a = +m[1], b = m[2] ? +m[2] : a;
+    return { hr: { kind: "bpm", lo: Math.min(a, b) - (m[2] ? 0 : 3), hi: Math.max(a, b) + (m[2] ? 0 : 3) } };
+  }
+  if ((m = body.match(/(\d{2,3})\s*(?:-\s*(\d{2,3}))?\s*%\s*(LTHR|HR)\b/i))) {
+    const a = +m[1], b = m[2] ? +m[2] : a;
+    return { hr: { kind: /LTHR/i.test(m[3]) ? "lthr" : "max", lo: Math.min(a, b), hi: Math.max(a, b) } };
+  }
+  return {};
+}
+// Convierte el objetivo de FC de un paso a ppm con las zonas actuales (u = límites superiores)
+function resolveHr(st, u) {
+  const h = st.hr;
+  if (!h || st.hrLo != null) return st;
+  const cfg = zoneCache.cfg || {};
+  let lo = null, hi = null, label = null;
+  if (h.kind === "zone" && u?.length) {
+    const f = Math.min(h.from, u.length), t = Math.min(h.to, u.length);
+    lo = f <= 1 ? 0 : u[f - 2] + 1; hi = u[t - 1]; label = h.label;
+  } else if (h.kind === "bpm") { lo = h.lo; hi = h.hi; }
+  else if (h.kind === "lthr" && cfg.lthr) { lo = Math.round(cfg.lthr * h.lo / 100); hi = Math.round(cfg.lthr * h.hi / 100); }
+  else if (h.kind === "max" && cfg.max_hr) { lo = Math.round(cfg.max_hr * h.lo / 100); hi = Math.round(cfg.max_hr * h.hi / 100); }
+  if (lo == null || hi == null) return st;
+  return { ...st, hrLo: lo, hrHi: hi, hrLabel: label };
+}
+const hasPace = (s) => s.fast != null;
+const hasHr = (s) => s.hrLo != null;
+// Pasos que se evalúan: los de ritmo salvo calentamiento/recuperación/enfriamiento;
+// los de FC también en calentamiento/enfriamiento (no en recuperaciones entre series)
+const isEvalStep = (s) => hasPace(s) ? !isRestStep(s) : hasHr(s) ? !/recovery|rest/.test(s.intensity) : false;
+const targetKey = (st) => hasPace(st) ? `p${st.fast}-${st.slow}` : `h${st.hrLo}-${st.hrHi}`;
+const targetLabel = (st) => hasPace(st) ? `${fmtSecs(st.fast)}-${fmtSecs(st.slow)}`
+  : `${st.hrLabel ? st.hrLabel + " " : ""}${st.hrLo <= 0 ? "≤" + st.hrHi : st.hrLo + "-" + st.hrHi} ppm`;
+
 function parseWorkoutText(text) {
   const out = []; let rep = null;
   const flush = () => {
@@ -412,6 +453,7 @@ function parseWorkoutText(text) {
     const p1 = body.match(/(\d{1,2}:\d{2})\s*Pace/i);
     if (pr) { const a = paceToSecs(pr[1]), b = paceToSecs(pr[2]); st.fast = Math.min(a, b); st.slow = Math.max(a, b); }
     else if (p1) { const a = paceToSecs(p1[1]); st.fast = a - 3; st.slow = a + 3; }
+    else Object.assign(st, parseHrTarget(body));
     (rep ? rep.steps : out).push(st);
   }
   flush();
@@ -430,9 +472,10 @@ const plannedKm = (e) => {
 
 // ─── Cumplimiento repetición a repetición ────────────────────────────────────
 // Empareja los intervalos registrados con los pasos del entreno planificado.
-function repCompliance(ivsRaw, steps) {
+function repCompliance(ivsRaw, stepsRaw, u = null) {
   const ivs = usefulIntervals(ivsRaw);
-  const targets = steps.filter(s => !isRestStep(s) && s.fast != null);
+  const steps = stepsRaw.map(s => resolveHr(s, u));
+  const targets = steps.filter(isEvalStep);
   if (!ivs.length || !targets.length) return null;
   const work = ivs.filter(iv => String(iv.type || "").toUpperCase() === "WORK");
   let pairs = [], mode;
@@ -447,13 +490,13 @@ function repCompliance(ivsRaw, steps) {
     if (k < ivs.length && k <= j + 2) { seq.push({ iv: ivs[k], st }); j = k + 1; } else break;
   }
   if (seq.length === steps.length) {
-    pairs = seq.filter(p => !isRestStep(p.st) && p.st.fast != null); mode = "exacto";
+    pairs = seq.filter(p => isEvalStep(p.st)); mode = "exacto";
   } else if (work.length === targets.length) {
     pairs = work.map((iv, i) => ({ iv, st: targets[i] })); mode = "por bloques de trabajo";
   } else {
     // c) Aproximado: cada intervalo de trabajo con el objetivo más cercano (±25 s/km)
     const cand = (work.length ? work : ivs.filter(iv => ivSecs(iv) >= 60));
-    const uniq = [...new Map(targets.map(t => [`${t.fast}-${t.slow}`, t])).values()];
+    const uniq = [...new Map(targets.filter(hasPace).map(t => [targetKey(t), t])).values()];
     pairs = cand.map(iv => {
       const p = 1000 / (iv.average_speed || iv.distance / ivSecs(iv));
       const st = uniq.map(t => ({ t, d: p < t.fast ? t.fast - p : p > t.slow ? p - t.slow : 0 })).sort((a, b) => a.d - b.d)[0];
@@ -465,21 +508,27 @@ function repCompliance(ivsRaw, steps) {
   const rows = pairs.map(({ iv, st }, i) => {
     const secs = iv.moving_time || iv.elapsed_time;
     const pace = 1000 / (iv.average_speed || iv.distance / secs);
-    const status = pace < st.fast - 2 ? `⚡${Math.round(st.fast - pace)}s` : pace > st.slow + 2 ? `🐢${Math.round(pace - st.slow)}s` : "✅";
-    return { n: i + 1, km: iv.distance / 1000, secs, pace, st, hr: iv.average_heartrate, max: iv.max_heartrate, status };
+    const hr = iv.average_heartrate;
+    let status;
+    if (hasPace(st)) status = pace < st.fast - 2 ? `⚡${Math.round(st.fast - pace)}s` : pace > st.slow + 2 ? `🐢${Math.round(pace - st.slow)}s` : "✅";
+    else status = !(hr > 0) ? "–" : hr > st.hrHi + 2 ? `🔺${Math.round(hr - st.hrHi)}ppm` : hr < st.hrLo - 2 ? `🔻${Math.round(st.hrLo - hr)}ppm` : "✅";
+    return { n: i + 1, km: iv.distance / 1000, secs, pace, st, hr, max: iv.max_heartrate, status, byHr: !hasPace(st) };
   });
   const ok = rows.filter(r => r.status === "✅").length;
   const fast = rows.filter(r => r.status.startsWith("⚡")).length, slow = rows.filter(r => r.status.startsWith("🐢")).length;
+  const hrHigh = rows.filter(r => r.status.startsWith("🔺")).length, hrLow = rows.filter(r => r.status.startsWith("🔻")).length;
+  const paceRows = rows.filter(r => !r.byHr);
   const hrs = rows.filter(r => r.hr > 0);
   return {
-    mode, rows, ok, fast, slow,
-    meanPace: mean(rows.map(r => r.pace)),
+    mode, rows, ok, fast, slow, hrHigh, hrLow,
+    meanPace: paceRows.length ? mean(paceRows.map(r => r.pace)) : null,
     hrFirst: hrs.length ? hrs[0].hr : null, hrLast: hrs.length ? hrs[hrs.length - 1].hr : null,
     maxHr: Math.max(0, ...rows.map(r => r.max || 0)) || null,
   };
 }
 function complianceSummary(c) {
-  return `${c.ok}/${c.rows.length} en rango${c.fast ? ` · ${c.fast} rápidas` : ""}${c.slow ? ` · ${c.slow} lentas` : ""} · media ${fmtSecs(c.meanPace)}` +
+  return `${c.ok}/${c.rows.length} en rango${c.fast ? ` · ${c.fast} rápidas` : ""}${c.slow ? ` · ${c.slow} lentas` : ""}` +
+    `${c.hrHigh ? ` · ${c.hrHigh} con FC alta` : ""}${c.hrLow ? ` · ${c.hrLow} con FC baja` : ""}${c.meanPace ? ` · media ritmo ${fmtSecs(c.meanPace)}` : ""}` +
     `${c.hrFirst ? ` · FC 1ª→última ${Math.round(c.hrFirst)}→${Math.round(c.hrLast)}` : ""}${c.maxHr ? ` · máx ${Math.round(c.maxHr)}` : ""}`;
 }
 
@@ -727,7 +776,7 @@ function assessReadiness({ d, wl, sessionType, yRpe }) {
 
 // ─── MCP Server factory ───────────────────────────────────────────────────────
 function createServer() {
-  const srv = new McpServer({ name: "intervals-mcp", version: "7.1.0" });
+  const srv = new McpServer({ name: "intervals-mcp", version: "7.2.0" });
 
   srv.tool("get_daily_briefing",
     "ONE-CALL morning report with a readiness traffic light (green/amber/red + concrete action for today's planned session, from HRV vs range, 7-day HRV trend, resting HR, sleep, TSB and yesterday's RPE), plus today's HRV vs 30-day baseline (mean ± SD), resting HR, sleep (Xh XXmin), CTL/ATL/TSB, ramp rate, today's and tomorrow's planned workouts, last activity, week-to-date km, and automatic alerts. Use this instead of calling wellness+fitness+events+activities separately.",
@@ -840,7 +889,7 @@ function createServer() {
   );
 
   srv.tool("get_post_workout_report",
-    "ONE-CALL post-workout analysis (default: latest activity). Returns metrics, GAP, planned-vs-done, HR zones, rep-by-rep compliance against the planned workout's pace targets, marathon-pace block (auto-detected, or from_km/to_km) with HR@4:16 and decoupling, whole-run decoupling, compact km splits, RPE/feel/notes.",
+    "ONE-CALL post-workout analysis (default: latest activity). Returns metrics, GAP, planned-vs-done, HR zones, rep-by-rep compliance against the planned workout's pace targets and HR targets (Z1-Z2 HR, bpm, %LTHR), marathon-pace block (auto-detected, or from_km/to_km) with HR@4:16 and decoupling, whole-run decoupling, compact km splits, RPE/feel/notes.",
     {
       activity_id: z.string().optional().describe("ID de la actividad (default: la última registrada)"),
       mp_from_km:  z.number().optional().describe("Inicio del bloque a ritmo maratón en km (si no, se detecta solo)"),
@@ -897,12 +946,12 @@ function createServer() {
         // Cumplimiento repetición a repetición
         let hasCompliance = false;
         if (steps.length && ivRaw?.icu_intervals?.length) {
-          const c = repCompliance(ivRaw.icu_intervals, steps);
-          if (c && new Set(c.rows.map(r => `${r.st.fast}-${r.st.slow}`)).size === 1 && c.rows.length === 1) { /* rodaje de un solo paso: sin tabla */ }
+          const c = repCompliance(ivRaw.icu_intervals, steps, u);
+          if (c && c.rows.length === 1 && !c.rows[0].byHr) { /* rodaje de un solo paso por ritmo: sin tabla */ }
           else if (c) {
             hasCompliance = true;
             L.push(`🎯 Cumplimiento (${c.mode}): ${complianceSummary(c)}`);
-            if (c.rows.length > 1) c.rows.slice(0, 30).forEach(r => L.push(`   ${String(r.n).padStart(2)} ${r.km.toFixed(2)}km ${fmtSecs(r.secs)} → ${fmtSecs(r.pace)} (obj ${fmtSecs(r.st.fast)}-${fmtSecs(r.st.slow)}) FC ${r.hr ? Math.round(r.hr) : "-"}/${r.max ? Math.round(r.max) : "-"} ${r.status}`));
+            if (c.rows.length > 1) c.rows.slice(0, 30).forEach(r => L.push(`   ${String(r.n).padStart(2)} ${r.km.toFixed(2)}km ${fmtSecs(r.secs)} → ${fmtSecs(r.pace)} (obj ${targetLabel(r.st)}) FC ${r.hr ? Math.round(r.hr) : "-"}/${r.max ? Math.round(r.max) : "-"} ${r.status}`));
           }
         }
 
@@ -1030,7 +1079,7 @@ function createServer() {
             const steps = ev ? parseWorkoutText(ev.description) : [];
             if (steps.some(s => !isRestStep(s) && s.fast != null && s.fast < 270)) {
               const iv = await fetchIntervals(a.id).catch(() => null);
-              const c = iv?.icu_intervals ? repCompliance(iv.icu_intervals, steps) : null;
+              const c = iv?.icu_intervals ? repCompliance(iv.icu_intervals, steps, await getHrZoneUpper()) : null;
               if (c) out.push(`${dayLabel(actDate(a))} · ${ev.name}: ${complianceSummary(c)}`);
             }
             if ((a.average_speed || 0) === 0 || a.average_speed > band.vLo * 0.75) {
@@ -1865,10 +1914,10 @@ app.delete(MCP_PATHS, requireAuth, async (req, res) => {
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/health", (_, res) => res.json({
-  status: "ok", version: "7.1.0", transport: "streamable-http", sessions: sessions.size, auth: !!AUTH_TOKEN,
+  status: "ok", version: "7.2.0", transport: "streamable-http", sessions: sessions.size, auth: !!AUTH_TOKEN,
   cache: { streams: streamCache.size, data: dataCache.size, hits: streamCache.hits + dataCache.hits, misses: streamCache.miss + dataCache.miss }
 }));
 
 app.listen(PORT, () => {
-  console.log(`✅ Intervals MCP v7.1 (Streamable HTTP, 18 herramientas) — port ${PORT} — athlete ${ATHLETE_ID} — ${AUTH_TOKEN ? "🔒 token activo" : "⚠️ SIN token: endpoint abierto"}`);
+  console.log(`✅ Intervals MCP v7.2 (Streamable HTTP, 18 herramientas) — port ${PORT} — athlete ${ATHLETE_ID} — ${AUTH_TOKEN ? "🔒 token activo" : "⚠️ SIN token: endpoint abierto"}`);
 });
